@@ -1,5 +1,8 @@
 ﻿$ErrorActionPreference = "Stop"
 
+# Ensure TLS 1.2+ is used
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+
 # Configuration
 $TorVersion = "14.0.4"
 $TorUrl = "https://archive.torproject.org/tor-package-archive/torbrowser/$TorVersion/tor-expert-bundle-windows-x86_64-$TorVersion.tar.gz"
@@ -19,64 +22,76 @@ function Ensure-Dir($path) {
     }
 }
 
-Write-Host "=== OnionHop Dependency Downloader ==="
+# Helper to pause on exit
+function Exit-WithPause($code) {
+    if ($Host.Name -eq "ConsoleHost") {
+        Write-Host "`nPress any key to exit..."
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    }
+    exit $code
+}
 
-# Cleanup temp
-if (Test-Path $TempDir) { Remove-Item $TempDir -Recurse -Force }
-Ensure-Dir $TempDir
-Ensure-Dir $TorDir
-Ensure-Dir $VpnDir
-Ensure-Dir $PtDir
-
-# --- 1. Tor Expert Bundle ---
-Write-Host "`n[1/3] Downloading Tor Expert Bundle ($TorVersion)..."
-$TorArchive = Join-Path $TempDir "tor.tar.gz"
 try {
-    Invoke-WebRequest -Uri $TorUrl -OutFile $TorArchive
-} catch {
-    Write-Error "Failed to download Tor. Check the version URL."
-    exit 1
-}
+    Write-Host "=== OnionHop Dependency Downloader ==="
 
-Write-Host "Extracting Tor..."
-tar -xf $TorArchive -C $TempDir
+    # Cleanup temp
+    if (Test-Path $TempDir) { Remove-Item $TempDir -Recurse -Force }
+    Ensure-Dir $TempDir
+    Ensure-Dir $TorDir
+    Ensure-Dir $VpnDir
+    Ensure-Dir $PtDir
 
-# Check structure
-$ExtractedTorRoot = Join-Path $TempDir "tor"
-if (-not (Test-Path $ExtractedTorRoot)) {
-    # Some archives might extract differently, but expert bundle usually uses 'tor/'
-    Write-Warning "Expected 'tor' directory in archive not found. Listing temp contents:"
-    Get-ChildItem $TempDir | ForEach-Object { Write-Host " - $($_.Name)" }
-    exit 1
-}
+    # --- 1. Tor Expert Bundle ---
+    Write-Host "`n[1/3] Downloading Tor Expert Bundle ($TorVersion)..."
+    $TorArchive = Join-Path $TempDir "tor.tar.gz"
+    try {
+        Invoke-WebRequest -Uri $TorUrl -OutFile $TorArchive
+    } catch {
+        Write-Error "Failed to download Tor. Check the version URL."
+        throw $_
+    }
 
-Write-Host "Installing Tor binaries..."
-Copy-Item (Join-Path $ExtractedTorRoot "tor.exe") $TorDir -Force
-Copy-Item (Join-Path $ExtractedTorRoot "tor-gencert.exe") $TorDir -Force
+    Write-Host "Extracting Tor..."
+    if (Get-Command "tar" -ErrorAction SilentlyContinue) {
+        tar -xf $TorArchive -C $TempDir
+    } else {
+        throw "The 'tar' command is required to extract the Tor Expert Bundle but was not found."
+    }
 
-$ExtractedDataRoot = Join-Path $TempDir "data"
-if (Test-Path $ExtractedDataRoot) {
-    Copy-Item (Join-Path $ExtractedDataRoot "geoip") $TorDir -Force
-    Copy-Item (Join-Path $ExtractedDataRoot "geoip6") $TorDir -Force
-} else {
-    Write-Warning "Could not find 'data' directory for geoip files."
-}
+    # Check structure
+    $ExtractedTorRoot = Join-Path $TempDir "tor"
+    if (-not (Test-Path $ExtractedTorRoot)) {
+        Write-Warning "Expected 'tor' directory in archive not found. Listing temp contents:"
+        Get-ChildItem $TempDir | ForEach-Object { Write-Host " - $($_.Name)" }
+        throw "Tor extraction failed or unexpected structure."
+    }
 
-Write-Host "Installing Pluggable Transports..."
-$ExtractedPtDir = Join-Path $ExtractedTorRoot "pluggable_transports"
-if (Test-Path $ExtractedPtDir) {
-    Copy-Item "$ExtractedPtDir\*" $PtDir -Recurse -Force
-}
+    Write-Host "Installing Tor binaries..."
+    Copy-Item (Join-Path $ExtractedTorRoot "tor.exe") $TorDir -Force
+    Copy-Item (Join-Path $ExtractedTorRoot "tor-gencert.exe") $TorDir -Force
 
-# Handle renamed binaries (lyrebird is often obfs4proxy in older bundles, but recent ones use lyrebird)
-if (-not (Test-Path (Join-Path $PtDir "lyrebird.exe")) -and (Test-Path (Join-Path $PtDir "obfs4proxy.exe"))) {
-    Write-Host "Renaming obfs4proxy.exe to lyrebird.exe..."
-    Rename-Item -Path (Join-Path $PtDir "obfs4proxy.exe") -NewName "lyrebird.exe" -Force
-}
+    $ExtractedDataRoot = Join-Path $TempDir "data"
+    if (Test-Path $ExtractedDataRoot) {
+        Copy-Item (Join-Path $ExtractedDataRoot "geoip") $TorDir -Force
+        Copy-Item (Join-Path $ExtractedDataRoot "geoip6") $TorDir -Force
+    } else {
+        Write-Warning "Could not find 'data' directory for geoip files."
+    }
 
-# --- 2. Sing-box ---
-Write-Host "`n[2/3] Fetching Sing-box..."
-try {
+    Write-Host "Installing Pluggable Transports..."
+    $ExtractedPtDir = Join-Path $ExtractedTorRoot "pluggable_transports"
+    if (Test-Path $ExtractedPtDir) {
+        Copy-Item "$ExtractedPtDir\*" $PtDir -Recurse -Force
+    }
+
+    # Handle renamed binaries
+    if (-not (Test-Path (Join-Path $PtDir "lyrebird.exe")) -and (Test-Path (Join-Path $PtDir "obfs4proxy.exe"))) {
+        Write-Host "Renaming obfs4proxy.exe to lyrebird.exe..."
+        Rename-Item -Path (Join-Path $PtDir "obfs4proxy.exe") -NewName "lyrebird.exe" -Force
+    }
+
+    # --- 2. Sing-box ---
+    Write-Host "`n[2/3] Fetching Sing-box..."
     $SbRelease = Invoke-RestMethod -Uri $SingBoxApiUrl
     $SbAsset = $SbRelease.assets | Where-Object { $_.name -like "*windows-amd64.zip" } | Select-Object -First 1
     if (-not $SbAsset) { throw "No windows-amd64 asset found." }
@@ -90,24 +105,23 @@ try {
     Expand-Archive -Path $SbArchive -DestinationPath $TempDir -Force
     $SbExtractedDir = Get-ChildItem -Path $TempDir -Directory | Where-Object { $_.Name -like "sing-box-*" } | Select-Object -First 1
     Copy-Item (Join-Path $SbExtractedDir.FullName "sing-box.exe") $VpnDir -Force
-} catch {
-    Write-Error "Failed to install Sing-box: $_"
-}
 
-# --- 3. Wintun ---
-Write-Host "`n[3/3] Downloading Wintun..."
-$WintunArchive = Join-Path $TempDir "wintun.zip"
-try {
+    # --- 3. Wintun ---
+    Write-Host "`n[3/3] Downloading Wintun..."
+    $WintunArchive = Join-Path $TempDir "wintun.zip"
     Invoke-WebRequest -Uri $WintunUrl -OutFile $WintunArchive
     
     Write-Host "Extracting Wintun..."
     Expand-Archive -Path $WintunArchive -DestinationPath (Join-Path $TempDir "wintun") -Force
     Copy-Item (Join-Path $TempDir "wintun\wintun\bin\amd64\wintun.dll") $VpnDir -Force
+
+    # Cleanup
+    Remove-Item $TempDir -Recurse -Force
+
+    Write-Host "`nDone! Binaries updated." -ForegroundColor Green
+    Exit-WithPause 0
+
 } catch {
-    Write-Error "Failed to install Wintun: $_"
+    Write-Error "An error occurred: $_"
+    Exit-WithPause 1
 }
-
-# Cleanup
-Remove-Item $TempDir -Recurse -Force
-
-Write-Host "`nDone! Binaries updated."
