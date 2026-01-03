@@ -116,19 +116,29 @@ OnionHop stores settings here:
 
 - Windows 10/11
 - .NET SDK **9.0** (project targets `net9.0-windows`)
+- PowerShell
 
-### Build
+### 1) Download dependencies
+Prebuilt binaries are not stored in the repository. You must fetch them first:
 
 ```powershell
-# from OnionHop/OnionHop
- dotnet build -c Release
+./download-deps.ps1
 ```
 
-### Publish
+This will download Tor, pluggable transports, Sing-box, and Wintun to the correct folders.
+
+### 2) Build
 
 ```powershell
 # from OnionHop/OnionHop
- dotnet publish -c Release -r win-x64 --self-contained false
+dotnet build -c Release
+```
+
+### 3) Publish
+
+```powershell
+# from OnionHop/OnionHop
+dotnet publish -c Release -r win-x64 --self-contained false
 ```
 
 Output:
@@ -152,7 +162,10 @@ OnionHop can be packaged into a shareable Windows installer using **Inno Setup 6
 From the repo root:
 
 ```powershell
-# Build a self-contained installer (recommended for sharing)
+# 1. Download dependencies (if not done already)
+./download-deps.ps1
+
+# 2. Build a self-contained installer (recommended for sharing)
 ./installer/build-installer.ps1 -SelfContained
 ```
 
@@ -170,10 +183,11 @@ If you prefer framework-dependent (requires .NET runtime on the target machine):
 
 ## Bundled dependencies
 
-This repo includes runtime binaries under:
+This repo **does not** include runtime binaries in git.
+The `download-deps.ps1` script fetches them from official sources:
 
-- `OnionHop/OnionHop/tor/`
-- `OnionHop/OnionHop/vpn/`
+- **Tor Expert Bundle**: `OnionHop/OnionHop/tor/`
+- **Sing-box & Wintun**: `OnionHop/OnionHop/vpn/`
 
 These are copied to output/publish via `OnionHop.csproj`.
 
