@@ -58,3 +58,12 @@ installer/**/*.exe
 # Icon conversion files
 logo.jpg
 convert_icon_logo.ps1
+
+# Downloaded Binaries (Dependencies)
+OnionHop/tor/tor.exe
+OnionHop/tor/tor-gencert.exe
+OnionHop/tor/geoip
+OnionHop/tor/geoip6
+OnionHop/tor/pluggable_transports/*.exe
+OnionHop/vpn/sing-box.exe
+OnionHop/vpn/wintun.dll
