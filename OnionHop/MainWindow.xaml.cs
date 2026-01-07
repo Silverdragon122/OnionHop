@@ -6,11 +6,13 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Reflection;
 using System.Security.Principal;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -18,7 +20,15 @@ using System.Windows;
 using System.Windows.Media.Effects;
 using System.Windows.Media;
 using System.Windows.Input;
+using System.Windows.Interop;
 using Microsoft.Win32;
+using Brush = System.Windows.Media.Brush;
+using Color = System.Windows.Media.Color;
+using SystemColors = System.Windows.SystemColors;
+using Clipboard = System.Windows.Clipboard;
+using MessageBox = System.Windows.MessageBox;
+using Application = System.Windows.Application;
+using SaveFileDialog = Microsoft.Win32.SaveFileDialog;
 
 namespace OnionHop;
 
@@ -39,6 +49,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private const string DefaultSingBoxRelativePath = "vpn\\sing-box.exe";
     private const string DefaultWintunRelativePath = "vpn\\wintun.dll";
     private const string DefaultPtConfigRelativePath = "tor\\pluggable_transports\\pt_config.json";
+    private const string AutoStartRegistryKey = @"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    private const string AutoStartValueName = "OnionHop";
+    private const string UpdateApiUrl = "https://api.github.com/repos/center2055/OnionHop/releases/latest";
+    private const string AutoStartModeOff = "Off";
+    private const string AutoStartModeOn = "On";
+    private const string AutoStartModeMinimized = "On (Minimized)";
 
     private bool _isConnecting;
     private bool _isConnected;
@@ -72,6 +88,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private bool _loadingSettings;
     private CancellationTokenSource? _settingsSaveCts;
+    private bool _isExiting;
+    private bool _startMinimizedOnLaunch;
+    private bool _isCheckingUpdates;
+    private bool _trayBalloonShown;
+    private System.Windows.Forms.NotifyIcon? _trayIcon;
+    private System.Drawing.Icon? _trayIconImage;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -91,6 +113,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         "Proxy Mode (Recommended)",
         "TUN/VPN Mode (Admin)"
+    };
+
+    public ObservableCollection<string> AutoStartModes { get; } = new()
+    {
+        AutoStartModeOff,
+        AutoStartModeOn,
+        AutoStartModeMinimized
     };
 
     public ObservableCollection<string> BridgeTypes { get; } = new();
@@ -153,6 +182,52 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         set => SetField(ref _autoConnect, value);
     }
     private bool _autoConnect;
+
+    public string AutoStartMode
+    {
+        get => _autoStartMode;
+        set
+        {
+            if (SetField(ref _autoStartMode, value))
+            {
+                UpdateStartupRegistration();
+            }
+        }
+    }
+    private string _autoStartMode = AutoStartModeOff;
+
+    public bool MinimizeToTray
+    {
+        get => _minimizeToTray;
+        set => SetField(ref _minimizeToTray, value);
+    }
+    private bool _minimizeToTray;
+
+    public bool AutoUpdate
+    {
+        get => _autoUpdate;
+        set
+        {
+            if (SetField(ref _autoUpdate, value) && value && !_loadingSettings)
+            {
+                _ = CheckForUpdatesAsync();
+            }
+        }
+    }
+    private bool _autoUpdate;
+
+    public bool UseNativeTheme
+    {
+        get => _useNativeTheme;
+        set
+        {
+            if (SetField(ref _useNativeTheme, value))
+            {
+                ApplyTheme(IsDarkMode);
+            }
+        }
+    }
+    private bool _useNativeTheme;
 
     public bool KillSwitchEnabled
     {
@@ -308,7 +383,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "- Useful when you want Tor browsing without breaking other apps\n" +
         "\n" +
         "Settings\n" +
-        "- Auto-Connect, Dark Mode, and Kill Switch are in the Settings tab.\n" +
+        "- Auto-Connect, Auto-Start (Off/On/Minimized), Minimize to Tray, Auto Update, Dark Mode, Native UI, and Kill Switch are in the Settings tab.\n" +
         "\n" +
         "Exit Location\n" +
         "- A hint for which country Tor should try to exit from. Not guaranteed.\n" +
@@ -319,6 +394,18 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "\n" +
         "Auto-Connect\n" +
         "- Connect automatically when OnionHop starts.\n" +
+        "\n" +
+        "Auto-Start\n" +
+        "- Launch on Windows sign-in; optional start minimized.\n" +
+        "\n" +
+        "Minimize to Tray\n" +
+        "- Closing the window keeps OnionHop running in the tray.\n" +
+        "\n" +
+        "Auto Update\n" +
+        "- Checks GitHub releases and offers updates.\n" +
+        "\n" +
+        "Native Windows UI\n" +
+        "- Uses standard window chrome; Dark Mode still applies.\n" +
         "\n" +
         "Kill Switch\n" +
         "- Available only in TUN/VPN Mode with Hybrid disabled (strict).\n" +
@@ -375,6 +462,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         UpdateMaximizeGlyph();
 
         AppendLog("OnionHop started.");
+        SystemEvents.SessionEnding += OnSessionEnding;
 
         if (IsKillSwitchEmergencyBlockActive() && !IsAdministrator())
         {
@@ -386,11 +474,22 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
+    private void OnSessionEnding(object? sender, SessionEndingEventArgs e)
+    {
+        _isExiting = true;
+    }
+
     private sealed class UserSettings
     {
         public bool AutoConnect { get; set; }
+        public string? AutoStartMode { get; set; }
+        public bool StartWithWindows { get; set; }
+        public bool StartMinimized { get; set; }
+        public bool MinimizeToTray { get; set; }
+        public bool AutoUpdate { get; set; }
         public bool KillSwitchEnabled { get; set; }
         public bool IsDarkMode { get; set; }
+        public bool UseNativeTheme { get; set; }
         public string? SelectedLocation { get; set; }
         public string? SelectedConnectionMode { get; set; }
         public bool UseHybridRouting { get; set; }
@@ -484,7 +583,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             _loadingSettings = true;
 
             AutoConnect = settings.AutoConnect;
+            AutoStartMode = ResolveAutoStartMode(settings);
+            MinimizeToTray = settings.MinimizeToTray;
+            AutoUpdate = settings.AutoUpdate;
             IsDarkMode = settings.IsDarkMode;
+            UseNativeTheme = settings.UseNativeTheme;
 
             if (!string.IsNullOrWhiteSpace(settings.SelectedLocation) && Locations.Contains(settings.SelectedLocation))
             {
@@ -514,6 +617,28 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             _loadingSettings = false;
         }
+    }
+
+    private string ResolveAutoStartMode(UserSettings settings)
+    {
+        if (string.IsNullOrWhiteSpace(settings.AutoStartMode))
+        {
+            return settings.StartWithWindows
+                ? settings.StartMinimized ? AutoStartModeMinimized : AutoStartModeOn
+                : AutoStartModeOff;
+        }
+
+        if (string.Equals(settings.AutoStartMode, AutoStartModeOn, StringComparison.OrdinalIgnoreCase))
+        {
+            return AutoStartModeOn;
+        }
+
+        if (string.Equals(settings.AutoStartMode, AutoStartModeMinimized, StringComparison.OrdinalIgnoreCase))
+        {
+            return AutoStartModeMinimized;
+        }
+
+        return AutoStartModeOff;
     }
 
     private void ScheduleSaveUserSettings()
@@ -550,8 +675,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         var settings = new UserSettings
         {
             AutoConnect = AutoConnect,
+            AutoStartMode = AutoStartMode,
+            StartWithWindows = !string.Equals(AutoStartMode, AutoStartModeOff, StringComparison.OrdinalIgnoreCase),
+            StartMinimized = string.Equals(AutoStartMode, AutoStartModeMinimized, StringComparison.OrdinalIgnoreCase),
+            MinimizeToTray = MinimizeToTray,
+            AutoUpdate = AutoUpdate,
             KillSwitchEnabled = KillSwitchEnabled,
             IsDarkMode = IsDarkMode,
+            UseNativeTheme = UseNativeTheme,
             SelectedLocation = SelectedLocation,
             SelectedConnectionMode = SelectedConnectionMode,
             UseHybridRouting = UseHybridRouting,
@@ -564,6 +695,46 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         File.WriteAllText(GetSettingsPath(), json);
     }
 
+    private void UpdateStartupRegistration()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(AutoStartRegistryKey, writable: true)
+                ?? Registry.CurrentUser.CreateSubKey(AutoStartRegistryKey);
+            if (key == null)
+            {
+                AppendLog("Startup registration failed: registry key not found.");
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(AutoStartMode) ||
+                string.Equals(AutoStartMode, AutoStartModeOff, StringComparison.OrdinalIgnoreCase))
+            {
+                key.DeleteValue(AutoStartValueName, false);
+                return;
+            }
+
+            var exePath = Environment.ProcessPath;
+            if (string.IsNullOrWhiteSpace(exePath))
+            {
+                AppendLog("Startup registration failed: executable path unavailable.");
+                return;
+            }
+
+            var command = $"\"{exePath}\"";
+            if (string.Equals(AutoStartMode, AutoStartModeMinimized, StringComparison.OrdinalIgnoreCase))
+            {
+                command = $"{command} --minimized";
+            }
+
+            key.SetValue(AutoStartValueName, command);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Startup registration failed: {ex.Message}");
+        }
+    }
+
     private void NotifyBridgeSettingsChanged()
     {
         if (_isConnected)
@@ -574,6 +745,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void ApplyTheme(bool dark)
     {
+        if (UseNativeTheme)
+        {
+            ApplyNativeTheme(dark);
+            return;
+        }
+
+        WindowStyle = WindowStyle.None;
         var appBg = dark ? Color.FromRgb(12, 16, 26) : Color.FromRgb(233, 237, 245);
         var cardBg = dark ? Color.FromRgb(26, 33, 48) : Colors.White;
         var navBg = dark ? Color.FromRgb(18, 24, 38) : Color.FromRgb(247, 249, 253);
@@ -632,16 +810,526 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         Resources["ComboItemHoverBrush"] = new SolidColorBrush(comboItemHover);
         Resources["ComboItemSelectedBrush"] = new SolidColorBrush(comboItemSelected);
         Resources["WindowControlBorderBrush"] = new SolidColorBrush(dark ? Color.FromRgb(46, 58, 84) : Color.FromRgb(224, 228, 237));
+        ApplyHeroPalette(light: false);
+        Resources["HeroComboStyle"] = Resources["DarkCombo"];
         Background = (Brush)Resources["AppBackgroundBrush"];
+    }
+
+    private void ApplyNativeTheme(bool dark)
+    {
+        WindowStyle = WindowStyle.SingleBorderWindow;
+        ResizeMode = ResizeMode.CanMinimize;
+
+        if (dark)
+        {
+            var appBg = Color.FromRgb(12, 16, 26);
+            var cardBg = Color.FromRgb(26, 33, 48);
+            var navBg = Color.FromRgb(18, 24, 38);
+            var titleBarBg = Color.FromRgb(18, 24, 38);
+            var titleBtnBg = Color.FromRgb(26, 33, 48);
+            var titleBtnHover = Color.FromRgb(33, 42, 61);
+            var titleBtnPressed = Color.FromRgb(40, 51, 74);
+            var navBtnFg = Color.FromRgb(221, 232, 248);
+            var navBtnBg = Color.FromRgb(26, 33, 48);
+            var navBtnHover = Color.FromRgb(33, 42, 61);
+            var segmentedBg = Color.FromRgb(26, 33, 48);
+            var primaryText = Color.FromRgb(226, 234, 248);
+            var secondaryText = Color.FromRgb(163, 178, 205);
+            var tertiaryText = Color.FromRgb(136, 151, 179);
+            var inputBorder = Color.FromRgb(46, 58, 84);
+            var toggleThumb = Color.FromRgb(240, 245, 255);
+            var toggleTrack = Color.FromRgb(76, 86, 108);
+            var comboBg = Color.FromRgb(26, 33, 48);
+            var comboBorder = Color.FromRgb(46, 58, 84);
+            var comboItemHover = Color.FromRgb(33, 42, 61);
+            var comboItemSelected = Color.FromRgb(40, 51, 74);
+            var hero = new LinearGradientBrush
+            {
+                StartPoint = new System.Windows.Point(0, 0),
+                EndPoint = new System.Windows.Point(1, 1),
+                GradientStops = new GradientStopCollection
+                {
+                    new(Color.FromRgb(15, 23, 48), 0),
+                    new(Color.FromRgb(28, 43, 77), 0.4),
+                    new(Color.FromRgb(15, 118, 110), 1)
+                }
+            };
+
+            Resources["AppBackgroundBrush"] = new SolidColorBrush(appBg);
+            Resources["CardBackgroundBrush"] = new SolidColorBrush(cardBg);
+            Resources["NavBackgroundBrush"] = new SolidColorBrush(navBg);
+            Resources["TitleBarBrush"] = new SolidColorBrush(titleBarBg);
+            Resources["TitleButtonBrush"] = new SolidColorBrush(titleBtnBg);
+            Resources["TitleButtonHoverBrush"] = new SolidColorBrush(titleBtnHover);
+            Resources["TitleButtonPressedBrush"] = new SolidColorBrush(titleBtnPressed);
+            Resources["NavButtonForegroundBrush"] = new SolidColorBrush(navBtnFg);
+            Resources["NavButtonBackgroundBrush"] = new SolidColorBrush(navBtnBg);
+            Resources["NavButtonHoverBrush"] = new SolidColorBrush(navBtnHover);
+            Resources["SegmentedButtonBackgroundBrush"] = new SolidColorBrush(segmentedBg);
+            Resources["HeroGradient"] = hero;
+            Resources["PrimaryTextBrush"] = new SolidColorBrush(primaryText);
+            Resources["SecondaryTextBrush"] = new SolidColorBrush(secondaryText);
+            Resources["TertiaryTextBrush"] = new SolidColorBrush(tertiaryText);
+            Resources["InputBorderBrush"] = new SolidColorBrush(inputBorder);
+            Resources["ToggleThumbBrush"] = new SolidColorBrush(toggleThumb);
+            Resources["ToggleTrackBrush"] = new SolidColorBrush(toggleTrack);
+            Resources["ToggleTrackCheckedBrush"] = new SolidColorBrush(Color.FromRgb(54, 193, 122));
+            Resources["ComboBackgroundBrush"] = new SolidColorBrush(comboBg);
+            Resources["ComboBorderBrush"] = new SolidColorBrush(comboBorder);
+            Resources["ComboForegroundBrush"] = new SolidColorBrush(primaryText);
+            Resources["ComboItemHoverBrush"] = new SolidColorBrush(comboItemHover);
+            Resources["ComboItemSelectedBrush"] = new SolidColorBrush(comboItemSelected);
+            Resources["WindowControlBorderBrush"] = new SolidColorBrush(Color.FromRgb(46, 58, 84));
+        }
+        else
+        {
+            Resources["AppBackgroundBrush"] = SystemColors.WindowBrush;
+            Resources["CardBackgroundBrush"] = SystemColors.ControlBrush;
+            Resources["NavBackgroundBrush"] = SystemColors.ControlBrush;
+            Resources["TitleBarBrush"] = SystemColors.ControlBrush;
+            Resources["TitleButtonBrush"] = SystemColors.ControlBrush;
+            Resources["TitleButtonHoverBrush"] = SystemColors.ControlLightBrush;
+            Resources["TitleButtonPressedBrush"] = SystemColors.ControlDarkBrush;
+            Resources["NavButtonForegroundBrush"] = SystemColors.ControlTextBrush;
+            Resources["NavButtonBackgroundBrush"] = SystemColors.ControlLightBrush;
+            Resources["NavButtonHoverBrush"] = SystemColors.ControlLightBrush;
+            Resources["SegmentedButtonBackgroundBrush"] = SystemColors.ControlLightBrush;
+            Resources["HeroGradient"] = SystemColors.ControlLightBrush;
+            Resources["PrimaryTextBrush"] = SystemColors.ControlTextBrush;
+            Resources["SecondaryTextBrush"] = SystemColors.GrayTextBrush;
+            Resources["TertiaryTextBrush"] = SystemColors.GrayTextBrush;
+            Resources["InputBorderBrush"] = SystemColors.ActiveBorderBrush;
+            Resources["ToggleThumbBrush"] = SystemColors.WindowBrush;
+            Resources["ToggleTrackBrush"] = SystemColors.ControlDarkBrush;
+            Resources["ToggleTrackCheckedBrush"] = SystemColors.HighlightBrush;
+            Resources["ComboBackgroundBrush"] = SystemColors.WindowBrush;
+            Resources["ComboBorderBrush"] = SystemColors.ActiveBorderBrush;
+            Resources["ComboForegroundBrush"] = SystemColors.ControlTextBrush;
+            Resources["ComboItemHoverBrush"] = SystemColors.ControlLightBrush;
+            Resources["ComboItemSelectedBrush"] = SystemColors.HighlightBrush;
+            Resources["WindowControlBorderBrush"] = SystemColors.ActiveBorderBrush;
+        }
+
+        ApplyHeroPalette(light: !dark);
+        Resources["HeroComboStyle"] = Resources[dark ? "DarkCombo" : "LightCombo"];
+        Background = (Brush)Resources["AppBackgroundBrush"];
+        TrySetImmersiveDarkMode(dark);
+    }
+
+    private void ApplyHeroPalette(bool light)
+    {
+        if (light)
+        {
+            Resources["HeroTitleBrush"] = SystemColors.ControlTextBrush;
+            Resources["HeroSubtitleBrush"] = SystemColors.GrayTextBrush;
+            Resources["HeroCardBackgroundBrush"] = SystemColors.WindowBrush;
+            Resources["HeroCardTextBrush"] = SystemColors.ControlTextBrush;
+            Resources["HeroCardSecondaryTextBrush"] = SystemColors.GrayTextBrush;
+            Resources["HeroCardValueBrush"] = SystemColors.ControlTextBrush;
+            Resources["HeroStatusTextBrush"] = SystemColors.GrayTextBrush;
+        }
+        else
+        {
+            Resources["HeroTitleBrush"] = new SolidColorBrush(Colors.White);
+            Resources["HeroSubtitleBrush"] = new SolidColorBrush(Color.FromRgb(219, 232, 255));
+            Resources["HeroCardBackgroundBrush"] = new SolidColorBrush(Color.FromRgb(43, 47, 115));
+            Resources["HeroCardTextBrush"] = new SolidColorBrush(Color.FromRgb(223, 230, 255));
+            Resources["HeroCardSecondaryTextBrush"] = new SolidColorBrush(Color.FromRgb(219, 232, 255));
+            Resources["HeroCardValueBrush"] = new SolidColorBrush(Colors.White);
+            Resources["HeroStatusTextBrush"] = new SolidColorBrush(Color.FromRgb(223, 239, 255));
+        }
+    }
+
+    private void TrySetImmersiveDarkMode(bool enabled)
+    {
+        if (!OperatingSystem.IsWindowsVersionAtLeast(10))
+        {
+            return;
+        }
+
+        var hwnd = new WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero)
+        {
+            if (!IsLoaded)
+            {
+                Dispatcher.BeginInvoke(new Action(() => TrySetImmersiveDarkMode(enabled)));
+            }
+            return;
+        }
+
+        var value = enabled ? 1 : 0;
+        _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ref value, sizeof(int));
+        _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1, ref value, sizeof(int));
+    }
+
+    private void EnsureTrayIcon()
+    {
+        if (_trayIcon != null)
+        {
+            return;
+        }
+
+        _trayIconImage = GetTrayIcon();
+        _trayIcon = new System.Windows.Forms.NotifyIcon
+        {
+            Text = "OnionHop",
+            Icon = _trayIconImage,
+            Visible = false
+        };
+
+        var menu = new System.Windows.Forms.ContextMenuStrip();
+        var openItem = new System.Windows.Forms.ToolStripMenuItem("Open OnionHop");
+        openItem.Click += (_, _) => Dispatcher.Invoke(ShowFromTray);
+        var exitItem = new System.Windows.Forms.ToolStripMenuItem("Exit");
+        exitItem.Click += (_, _) => Dispatcher.Invoke(ExitApplication);
+        menu.Items.Add(openItem);
+        menu.Items.Add(exitItem);
+        _trayIcon.ContextMenuStrip = menu;
+        _trayIcon.DoubleClick += (_, _) => Dispatcher.Invoke(ShowFromTray);
+    }
+
+    private static System.Drawing.Icon GetTrayIcon()
+    {
+        try
+        {
+            var iconPath = Path.Combine(AppContext.BaseDirectory, "OnionHop.ico");
+            if (File.Exists(iconPath))
+            {
+                return new System.Drawing.Icon(iconPath);
+            }
+
+            var exePath = Environment.ProcessPath;
+            if (!string.IsNullOrWhiteSpace(exePath) && File.Exists(exePath))
+            {
+                var icon = System.Drawing.Icon.ExtractAssociatedIcon(exePath);
+                if (icon != null)
+                {
+                    return (System.Drawing.Icon)icon.Clone();
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return (System.Drawing.Icon)System.Drawing.SystemIcons.Application.Clone();
+    }
+
+    private void HideToTray()
+    {
+        EnsureTrayIcon();
+        if (_trayIcon != null)
+        {
+            _trayIcon.Visible = true;
+            if (!_trayBalloonShown)
+            {
+                _trayBalloonShown = true;
+                _trayIcon.BalloonTipTitle = "OnionHop";
+                _trayIcon.BalloonTipText = "OnionHop is still running in the tray.";
+                _trayIcon.ShowBalloonTip(2000);
+            }
+        }
+
+        ShowInTaskbar = false;
+        Hide();
+    }
+
+    private void ShowFromTray()
+    {
+        ShowInTaskbar = true;
+        Show();
+        if (WindowState == WindowState.Minimized)
+        {
+            WindowState = WindowState.Normal;
+        }
+        Activate();
+
+        if (_trayIcon != null)
+        {
+            _trayIcon.Visible = false;
+        }
+    }
+
+    public void RestoreFromExternalActivation()
+    {
+        if (MinimizeToTray)
+        {
+            ShowInTaskbar = true;
+            if (_trayIcon != null)
+            {
+                _trayIcon.Visible = false;
+            }
+        }
+
+        if (!IsVisible)
+        {
+            Show();
+        }
+
+        if (WindowState == WindowState.Minimized)
+        {
+            WindowState = WindowState.Normal;
+        }
+
+        Activate();
+        Topmost = true;
+        Topmost = false;
+        Focus();
+    }
+
+    private void HandleCloseRequest()
+    {
+        if (MinimizeToTray && !_isExiting)
+        {
+            HideToTray();
+            return;
+        }
+
+        ExitApplication();
+    }
+
+    private void ExitApplication()
+    {
+        _isExiting = true;
+        if (_trayIcon != null)
+        {
+            _trayIcon.Visible = false;
+        }
+        Close();
     }
 
     protected override async void OnContentRendered(EventArgs e)
     {
         base.OnContentRendered(e);
+        if (_startMinimizedOnLaunch)
+        {
+            if (MinimizeToTray)
+            {
+                HideToTray();
+            }
+            else
+            {
+                WindowState = WindowState.Minimized;
+            }
+        }
+
         if (AutoConnect)
         {
             await ConnectAsync();
         }
+
+        if (AutoUpdate)
+        {
+            _ = CheckForUpdatesAsync();
+        }
+    }
+
+    private async Task CheckForUpdatesAsync()
+    {
+        if (_isCheckingUpdates || !AutoUpdate)
+        {
+            return;
+        }
+
+        _isCheckingUpdates = true;
+        try
+        {
+            AppendLog("Checking for updates...");
+            var latest = await GetLatestReleaseAsync();
+            if (latest == null)
+            {
+                AppendLog("Update check failed.");
+                return;
+            }
+
+            var currentVersion = GetCurrentVersion();
+            if (latest.Version <= currentVersion)
+            {
+                AppendLog("No updates available.");
+                return;
+            }
+
+            AppendLog($"Update available: {latest.Version} (current {currentVersion}).");
+            StatusMessage = $"Update available: v{latest.Version}.";
+
+            if (!IsVisible)
+            {
+                return;
+            }
+
+            var result = MessageBox.Show(
+                this,
+                $"An update is available (v{latest.Version}). Download and install now?",
+                "OnionHop Update",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Information);
+
+            if (result != MessageBoxResult.Yes)
+            {
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(latest.DownloadUrl))
+            {
+                OpenUpdatePage(latest.HtmlUrl);
+                return;
+            }
+
+            var installerPath = await DownloadUpdateAsync(latest);
+            if (string.IsNullOrWhiteSpace(installerPath))
+            {
+                OpenUpdatePage(latest.HtmlUrl);
+                return;
+            }
+
+            AppendLog($"Launching updater: {installerPath}");
+            Process.Start(new ProcessStartInfo(installerPath) { UseShellExecute = true });
+            ExitApplication();
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Update check failed: {ex.Message}");
+        }
+        finally
+        {
+            _isCheckingUpdates = false;
+        }
+    }
+
+    private static Version GetCurrentVersion()
+    {
+        return Assembly.GetEntryAssembly()?.GetName().Version ?? new Version(1, 0, 0);
+    }
+
+    private static Version ParseVersion(string? tag)
+    {
+        if (string.IsNullOrWhiteSpace(tag))
+        {
+            return new Version(0, 0, 0);
+        }
+
+        var clean = tag.Trim().TrimStart('v', 'V');
+        var match = Regex.Match(clean, @"\d+(\.\d+){0,3}");
+        if (match.Success && Version.TryParse(match.Value, out var version))
+        {
+            return version;
+        }
+
+        return new Version(0, 0, 0);
+    }
+
+    private async Task<UpdateInfo?> GetLatestReleaseAsync()
+    {
+        using var client = new HttpClient();
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("OnionHop");
+
+        using var response = await client.GetAsync(UpdateApiUrl);
+        if (!response.IsSuccessStatusCode)
+        {
+            return null;
+        }
+
+        var json = await response.Content.ReadAsStringAsync();
+        var release = JsonSerializer.Deserialize<GitHubRelease>(json);
+        if (release == null)
+        {
+            return null;
+        }
+
+        var latestVersion = ParseVersion(release.TagName);
+        if (latestVersion.Major == 0 && latestVersion.Minor == 0 && latestVersion.Build == 0)
+        {
+            return null;
+        }
+
+        var asset = release.Assets?
+            .FirstOrDefault(a => a.Name != null
+                                 && a.Name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+                                 && a.Name.Contains("OnionHop", StringComparison.OrdinalIgnoreCase))
+            ?? release.Assets?.FirstOrDefault(a => a.Name != null
+                                                  && a.Name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase));
+
+        return new UpdateInfo
+        {
+            Version = latestVersion,
+            DownloadUrl = asset?.BrowserDownloadUrl,
+            HtmlUrl = release.HtmlUrl,
+            FileName = asset?.Name
+        };
+    }
+
+    private static void OpenUpdatePage(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        }
+        catch
+        {
+        }
+    }
+
+    private static async Task<string?> DownloadUpdateAsync(UpdateInfo info)
+    {
+        if (string.IsNullOrWhiteSpace(info.DownloadUrl))
+        {
+            return null;
+        }
+
+        var updatesDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OnionHop", "updates");
+        Directory.CreateDirectory(updatesDir);
+        var fileName = string.IsNullOrWhiteSpace(info.FileName)
+            ? $"OnionHop-Setup-{info.Version}.exe"
+            : info.FileName;
+        var targetPath = Path.Combine(updatesDir, fileName);
+
+        using var client = new HttpClient();
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("OnionHop");
+
+        using var response = await client.GetAsync(info.DownloadUrl);
+        if (!response.IsSuccessStatusCode)
+        {
+            return null;
+        }
+
+        await using var stream = await response.Content.ReadAsStreamAsync();
+        await using var file = new FileStream(targetPath, FileMode.Create, FileAccess.Write, FileShare.None);
+        await stream.CopyToAsync(file);
+        return targetPath;
+    }
+
+    private sealed class UpdateInfo
+    {
+        public Version Version { get; init; } = new Version(0, 0, 0);
+        public string? DownloadUrl { get; init; }
+        public string? HtmlUrl { get; init; }
+        public string? FileName { get; init; }
+    }
+
+    private sealed class GitHubRelease
+    {
+        [JsonPropertyName("tag_name")]
+        public string? TagName { get; set; }
+
+        [JsonPropertyName("html_url")]
+        public string? HtmlUrl { get; set; }
+
+        [JsonPropertyName("assets")]
+        public List<GitHubAsset>? Assets { get; set; }
+    }
+
+    private sealed class GitHubAsset
+    {
+        [JsonPropertyName("name")]
+        public string? Name { get; set; }
+
+        [JsonPropertyName("browser_download_url")]
+        public string? BrowserDownloadUrl { get; set; }
     }
 
     private async void ConnectButton_Click(object sender, RoutedEventArgs e)
@@ -1304,6 +1992,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             {
                 AutoConnect = true;
             }
+
+            if (string.Equals(args[i], "--minimized", StringComparison.OrdinalIgnoreCase))
+            {
+                _startMinimizedOnLaunch = true;
+            }
         }
     }
 
@@ -1763,9 +2456,22 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
+    protected override void OnClosing(CancelEventArgs e)
+    {
+        if (!_isExiting && MinimizeToTray)
+        {
+            e.Cancel = true;
+            HideToTray();
+            return;
+        }
+
+        base.OnClosing(e);
+    }
+
     protected override void OnClosed(EventArgs e)
     {
         base.OnClosed(e);
+        SystemEvents.SessionEnding -= OnSessionEnding;
         if (_systemProxyApplied)
         {
             ApplySystemProxy(false);
@@ -1775,6 +2481,19 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         StopSingBoxProcess();
         StopTorProcess();
+
+        if (_trayIcon != null)
+        {
+            _trayIcon.Visible = false;
+            _trayIcon.Dispose();
+            _trayIcon = null;
+        }
+
+        if (_trayIconImage != null)
+        {
+            _trayIconImage.Dispose();
+            _trayIconImage = null;
+        }
     }
 
     private static string GetKillSwitchRuleName() => "OnionHop KillSwitch Emergency Block";
@@ -1920,8 +2639,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         if (propertyName is nameof(AutoConnect)
+            or nameof(AutoStartMode)
+            or nameof(MinimizeToTray)
+            or nameof(AutoUpdate)
             or nameof(KillSwitchEnabled)
             or nameof(IsDarkMode)
+            or nameof(UseNativeTheme)
             or nameof(SelectedLocation)
             or nameof(SelectedConnectionMode)
             or nameof(UseHybridRouting)
@@ -1968,7 +2691,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void CloseButton_Click(object sender, RoutedEventArgs e)
     {
-        Close();
+        HandleCloseRequest();
     }
 
     private void TitleBar_MouseDown(object sender, MouseButtonEventArgs e)
@@ -2040,6 +2763,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     [DllImport("wininet.dll", SetLastError = true)]
     private static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int lpdwBufferLength);
 
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
     private const int INTERNET_OPTION_SETTINGS_CHANGED = 39;
     private const int INTERNET_OPTION_REFRESH = 37;
+    private const int DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1 = 19;
+    private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
 }

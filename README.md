@@ -58,9 +58,17 @@ Notes
 - Kill Switch (strict TUN only)
   - If the tunnel drops unexpectedly, OnionHop blocks outbound traffic using Windows Firewall to prevent leaks.
   - Disconnect (as Administrator) to restore normal traffic.
+- Start with Windows (optional) with start-minimized support
+- Minimize-to-tray option on close
+- Auto-update checks via GitHub releases
+- Native Windows UI theme toggle
 - Persisted settings
   - Auto-Connect
+  - Start with Windows + Start Minimized
+  - Minimize to Tray
+  - Auto Update
   - Dark Mode
+  - Native Windows UI
   - Kill Switch toggle
   - Exit Location
   - Connection mode + Hybrid

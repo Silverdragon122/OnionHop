@@ -9,7 +9,7 @@
         WindowStartupLocation="CenterScreen"
         WindowStyle="None"
         ResizeMode="CanMinimize"
-        Icon="{DynamicResource OnionIconImage}"
+        Icon="pack://siteoforigin:,,,/OnionHop.ico"
         StateChanged="Window_StateChanged"
         Background="{DynamicResource AppBackgroundBrush}">
     <Window.Resources>
@@ -295,6 +295,16 @@
         </Grid.RowDefinitions>
 
         <Border Grid.Row="0" Background="{DynamicResource TitleBarBrush}" Padding="14,10" CornerRadius="14" Margin="12,12,12,6">
+            <Border.Style>
+                <Style TargetType="Border">
+                    <Setter Property="Visibility" Value="Visible"/>
+                    <Style.Triggers>
+                        <DataTrigger Binding="{Binding UseNativeTheme}" Value="True">
+                            <Setter Property="Visibility" Value="Collapsed"/>
+                        </DataTrigger>
+                    </Style.Triggers>
+                </Style>
+            </Border.Style>
             <Grid MouseDown="TitleBar_MouseDown">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
@@ -401,27 +411,27 @@
                                         <StackPanel>
                                             <StackPanel Orientation="Horizontal">
                                                 <StackPanel>
-                                                    <TextBlock Text="Connection Mode" Foreground="White" FontSize="22" FontWeight="Bold"/>
-                                                    <TextBlock Text="Choose Proxy or TUN" Foreground="#dbe8ff" FontSize="13"/>
+                                                    <TextBlock Text="Connection Mode" Foreground="{DynamicResource HeroTitleBrush}" FontSize="22" FontWeight="Bold"/>
+                                                    <TextBlock Text="Choose Proxy or TUN" Foreground="{DynamicResource HeroSubtitleBrush}" FontSize="13"/>
                                                 </StackPanel>
                                             </StackPanel>
 
-                                            <Border CornerRadius="16" Background="#2b2f73" Padding="12" Width="260" Margin="0,14,0,0">
+                                            <Border CornerRadius="16" Background="{DynamicResource HeroCardBackgroundBrush}" Padding="12" Width="260" Margin="0,14,0,0">
                                                 <StackPanel>
-                                                    <TextBlock Text="Mode" Foreground="#dfe6ff" FontSize="12"/>
+                                                    <TextBlock Text="Mode" Foreground="{DynamicResource HeroCardTextBrush}" FontSize="12"/>
                                                     <ComboBox Margin="0,8,0,0"
                                                               ItemsSource="{Binding ConnectionModes}"
                                                               SelectedItem="{Binding SelectedConnectionMode}"
-                                                              Style="{StaticResource DarkCombo}"
+                                                              Style="{DynamicResource HeroComboStyle}"
                                                               MaxDropDownHeight="220"/>
-                                                    <TextBlock Text="TUN/VPN requires Administrator." Foreground="#dbe8ff" FontSize="12" Margin="0,8,0,0"/>
+                                                    <TextBlock Text="TUN/VPN requires Administrator." Foreground="{DynamicResource HeroCardSecondaryTextBrush}" FontSize="12" Margin="0,8,0,0"/>
                                                 </StackPanel>
                                             </Border>
 
-                                            <Border CornerRadius="16" Background="#2b2f73" Padding="12" Width="260" Margin="0,10,0,0" Opacity="0.95"
+                                            <Border CornerRadius="16" Background="{DynamicResource HeroCardBackgroundBrush}" Padding="12" Width="260" Margin="0,10,0,0" Opacity="0.95"
                                                     Visibility="{Binding IsTunMode, Converter={StaticResource BoolToVis}}">
                                                 <DockPanel>
-                                                    <TextBlock Text="Hybrid (browser via Tor)" Foreground="#dfe6ff" FontSize="13" DockPanel.Dock="Left" VerticalAlignment="Center"/>
+                                                    <TextBlock Text="Hybrid (browser via Tor)" Foreground="{DynamicResource HeroCardTextBrush}" FontSize="13" DockPanel.Dock="Left" VerticalAlignment="Center"/>
                                                     <ToggleButton Style="{StaticResource ToggleSwitch}"
                                                                   DockPanel.Dock="Right"
                                                                   IsChecked="{Binding UseHybridRouting}"/>
@@ -434,21 +444,21 @@
                                                     <ColumnDefinition Width="*"/>
                                                 </Grid.ColumnDefinitions>
 
-                                                <Border Grid.Column="0" CornerRadius="14" Padding="10,8" Background="#2b2f73" Margin="0,0,10,0">
+                                                <Border Grid.Column="0" CornerRadius="14" Padding="10,8" Background="{DynamicResource HeroCardBackgroundBrush}" Margin="0,0,10,0">
                                                     <StackPanel>
-                                                        <TextBlock Foreground="#e9f1ff" Text="Exit Location" FontWeight="SemiBold" FontSize="12"/>
+                                                        <TextBlock Foreground="{DynamicResource HeroCardTextBrush}" Text="Exit Location" FontWeight="SemiBold" FontSize="12"/>
                                                         <ComboBox Margin="0,6,0,0"
                                                                   ItemsSource="{Binding Locations}"
                                                                   SelectedItem="{Binding SelectedLocation}"
-                                                                  Style="{StaticResource DarkCombo}"
+                                                                  Style="{DynamicResource HeroComboStyle}"
                                                                   MaxDropDownHeight="200"/>
                                                     </StackPanel>
                                                 </Border>
 
-                                                <Border Grid.Column="1" CornerRadius="14" Padding="10,8" Background="#2b2f73">
+                                                <Border Grid.Column="1" CornerRadius="14" Padding="10,8" Background="{DynamicResource HeroCardBackgroundBrush}">
                                                     <StackPanel>
-                                                        <TextBlock Foreground="#e9f1ff" Text="Current IP" FontWeight="SemiBold" FontSize="12"/>
-                                                        <TextBlock Text="{Binding CurrentIp}" Foreground="White" FontSize="16" FontWeight="Bold" Margin="0,8,0,0"/>
+                                                        <TextBlock Foreground="{DynamicResource HeroCardTextBrush}" Text="Current IP" FontWeight="SemiBold" FontSize="12"/>
+                                                        <TextBlock Text="{Binding CurrentIp}" Foreground="{DynamicResource HeroCardValueBrush}" FontSize="16" FontWeight="Bold" Margin="0,8,0,0"/>
                                                     </StackPanel>
                                                 </Border>
                                             </Grid>
@@ -484,7 +494,7 @@
                                                     </StackPanel>
                                                 </Button>
                                             </Grid>
-                                            <TextBlock Text="{Binding ConnectionStatus}" Foreground="#dfefff" FontSize="14" HorizontalAlignment="Center" Margin="0,10,0,0"/>
+                                            <TextBlock Text="{Binding ConnectionStatus}" Foreground="{DynamicResource HeroStatusTextBrush}" FontSize="14" HorizontalAlignment="Center" Margin="0,10,0,0"/>
                                         </StackPanel>
                                     </Grid>
                                 </Border>
@@ -616,11 +626,50 @@
                                 </DockPanel>
 
                                 <DockPanel Margin="0,14,0,0">
+                                    <ComboBox DockPanel.Dock="Right"
+                                              Width="190"
+                                              ItemsSource="{Binding AutoStartModes}"
+                                              SelectedItem="{Binding AutoStartMode}"
+                                              Style="{StaticResource LightCombo}"/>
+                                    <StackPanel DockPanel.Dock="Left">
+                                        <TextBlock Text="Start with Windows" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                                        <TextBlock Text="Off / On / Minimized" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}"/>
+                                    </StackPanel>
+                                </DockPanel>
+
+                                <DockPanel Margin="0,14,0,0">
+                                    <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
+                                                  IsChecked="{Binding MinimizeToTray}"/>
+                                    <StackPanel DockPanel.Dock="Left">
+                                        <TextBlock Text="Minimize to Tray" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                                        <TextBlock Text="Close button keeps OnionHop in the tray" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}"/>
+                                    </StackPanel>
+                                </DockPanel>
+
+                                <DockPanel Margin="0,14,0,0">
+                                    <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
+                                                  IsChecked="{Binding AutoUpdate}"/>
+                                    <StackPanel DockPanel.Dock="Left">
+                                        <TextBlock Text="Auto Update" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                                        <TextBlock Text="Check GitHub releases and install updates" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" TextWrapping="Wrap"/>
+                                    </StackPanel>
+                                </DockPanel>
+
+                                <DockPanel Margin="0,14,0,0">
+                                    <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
+                                                  IsChecked="{Binding UseNativeTheme}"/>
+                                    <StackPanel DockPanel.Dock="Left">
+                                        <TextBlock Text="Native Windows UI" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                                        <TextBlock Text="Use standard window chrome and system colors" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" TextWrapping="Wrap"/>
+                                    </StackPanel>
+                                </DockPanel>
+
+                                <DockPanel Margin="0,14,0,0">
                                     <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
                                                   IsChecked="{Binding IsDarkMode}"/>
                                     <StackPanel DockPanel.Dock="Left">
                                         <TextBlock Text="Dark Mode" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
-                                        <TextBlock Text="Switch theme" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}"/>
+                                        <TextBlock Text="Switch theme (also applies in Native UI)" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}"/>
                                     </StackPanel>
                                 </DockPanel>
 
