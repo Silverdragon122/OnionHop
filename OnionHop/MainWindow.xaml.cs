@@ -21,6 +21,7 @@ using System.Windows.Media.Effects;
 using System.Windows.Media;
 using System.Windows.Input;
 using System.Windows.Interop;
+using System.Windows.Shell;
 using Microsoft.Win32;
 using Brush = System.Windows.Media.Brush;
 using Color = System.Windows.Media.Color;
@@ -97,6 +98,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private bool _trayBalloonShown;
     private System.Windows.Forms.NotifyIcon? _trayIcon;
     private System.Drawing.Icon? _trayIconImage;
+    private WindowChrome? _customChrome;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -485,6 +487,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public MainWindow()
     {
         InitializeComponent();
+        _customChrome = WindowChrome.GetWindowChrome(this);
         DataContext = this;
 
         LoadBridgeConfig();
@@ -824,6 +827,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         WindowStyle = WindowStyle.None;
         ResizeMode = ResizeMode.CanResize;
+        ApplyWindowChrome(true);
         var appBg = dark ? Color.FromRgb(12, 16, 26) : Color.FromRgb(233, 237, 245);
         var cardBg = dark ? Color.FromRgb(26, 33, 48) : Colors.White;
         var navBg = dark ? Color.FromRgb(18, 24, 38) : Color.FromRgb(247, 249, 253);
@@ -891,6 +895,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         WindowStyle = WindowStyle.SingleBorderWindow;
         ResizeMode = ResizeMode.CanResize;
+        ApplyWindowChrome(false);
 
         if (dark)
         {
@@ -984,8 +989,45 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         ApplyHeroPalette(light: !dark);
         Resources["HeroComboStyle"] = Resources[dark ? "DarkCombo" : "LightCombo"];
-        Background = (Brush)Resources["AppBackgroundBrush"];
+
+        if (!UseNativeTheme)
+        {
+            Background = System.Windows.Media.Brushes.Transparent;
+            if (RootGrid != null)
+            {
+                RootGrid.Background = (Brush)Resources["AppBackgroundBrush"];
+            }
+        }
+        else
+        {
+             Background = (Brush)Resources["AppBackgroundBrush"];
+             if (RootGrid != null)
+             {
+                 RootGrid.Background = System.Windows.Media.Brushes.Transparent;
+             }
+        }
+        
         TrySetImmersiveDarkMode(dark);
+    }
+
+    private void ApplyWindowChrome(bool enable)
+    {
+        if (!enable)
+        {
+            WindowChrome.SetWindowChrome(this, null);
+            return;
+        }
+
+        _customChrome ??= new WindowChrome
+        {
+            CaptionHeight = 0,
+            ResizeBorderThickness = new Thickness(6),
+            CornerRadius = new CornerRadius(0),
+            GlassFrameThickness = new Thickness(-1),
+            UseAeroCaptionButtons = false
+        };
+
+        WindowChrome.SetWindowChrome(this, _customChrome);
     }
 
     private void ApplyHeroPalette(bool light)
