@@ -5,10 +5,10 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d"
         Title="OnionHop"
-        Width="1280" Height="820" MinWidth="1280" MinHeight="820" MaxWidth="1280" MaxHeight="820"
+        Width="1280" Height="820" MinWidth="1280" MinHeight="820"
         WindowStartupLocation="CenterScreen"
         WindowStyle="None"
-        ResizeMode="CanMinimize"
+        ResizeMode="CanResize"
         Icon="pack://siteoforigin:,,,/OnionHop.ico"
         StateChanged="Window_StateChanged"
         Background="{DynamicResource AppBackgroundBrush}">
@@ -172,6 +172,7 @@
                                                 <ContentPresenter Margin="0"
                                                                   HorizontalAlignment="Left"
                                                                   VerticalAlignment="Center"
+                                                                  TextElement.Foreground="{TemplateBinding Foreground}"
                                                                   Content="{Binding SelectionBoxItem, RelativeSource={RelativeSource AncestorType=ComboBox}}"/>
                                                 <Path x:Name="Arrow"
                                                       HorizontalAlignment="Right"
@@ -216,6 +217,7 @@
                         <Setter Property="Padding" Value="10,6"/>
                         <Setter Property="HorizontalContentAlignment" Value="Left"/>
                         <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+                        <Setter Property="Foreground" Value="{Binding RelativeSource={RelativeSource AncestorType=ComboBox}, Path=Foreground}"/>
                         <Style.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
                                 <Setter Property="Background" Value="{DynamicResource ComboItemHoverBrush}"/>
@@ -327,7 +329,7 @@
                     <Button x:Name="MinButton" Style="{StaticResource WindowControlButton}" Click="MinimizeButton_Click">
                         <TextBlock Text="&#xE921;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource PrimaryTextBrush}"/>
                     </Button>
-                    <Button x:Name="MaxButton" Style="{StaticResource WindowControlButton}" Click="MaximizeButton_Click" Visibility="Collapsed">
+                    <Button x:Name="MaxButton" Style="{StaticResource WindowControlButton}" Click="MaximizeButton_Click" Visibility="Visible">
                         <TextBlock x:Name="MaximizeIcon" Text="&#xE922;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource PrimaryTextBrush}"/>
                     </Button>
                     <Button x:Name="CloseButton" Style="{StaticResource CloseControlButton}" Click="CloseButton_Click">
@@ -560,7 +562,7 @@
 
         <Grid Grid.RowSpan="2" Background="{DynamicResource OverlayScrimBrush}" Visibility="{Binding IsOverlayVisible, Converter={StaticResource BoolToVis}}"
               MouseDown="OverlayBackground_MouseDown">
-            <Border CornerRadius="18" Background="{DynamicResource CardBackgroundBrush}" Padding="16" Width="980" Height="640" HorizontalAlignment="Center" VerticalAlignment="Center">
+            <Border CornerRadius="18" Background="{DynamicResource CardBackgroundBrush}" Padding="16" MaxWidth="980" MaxHeight="640" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="24">
                 <Grid>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto"/>
@@ -603,7 +605,7 @@
 
                         <Border CornerRadius="14" Background="{DynamicResource NavBackgroundBrush}" Padding="12"
                                 Visibility="{Binding ShowAbout, Converter={StaticResource BoolToVis}}">
-                            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                            <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                                 <StackPanel>
                                     <TextBlock Text="About" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
                                     <TextBlock Text="{Binding AboutText}" Margin="0,10,0,0" TextWrapping="Wrap" Foreground="{DynamicResource PrimaryTextBrush}" FontSize="13"/>
@@ -613,115 +615,126 @@
 
                         <Border CornerRadius="14" Background="{DynamicResource NavBackgroundBrush}" Padding="12"
                                 Visibility="{Binding ShowSettings, Converter={StaticResource BoolToVis}}">
-                            <StackPanel>
-                                <TextBlock Text="Settings" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                <StackPanel>
+                                    <TextBlock Text="Settings" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
 
-                                <DockPanel Margin="0,14,0,0">
-                                    <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
-                                                  IsChecked="{Binding AutoConnect}"/>
-                                    <StackPanel DockPanel.Dock="Left">
-                                        <TextBlock Text="Auto-Connect" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
-                                        <TextBlock Text="Connect on launch" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}"/>
-                                    </StackPanel>
-                                </DockPanel>
+                                    <DockPanel Margin="0,14,0,0">
+                                        <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
+                                                      IsChecked="{Binding AutoConnect}"/>
+                                        <StackPanel DockPanel.Dock="Left">
+                                            <TextBlock Text="Auto-Connect" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                                            <TextBlock Text="Connect on launch" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}"/>
+                                        </StackPanel>
+                                    </DockPanel>
 
-                                <DockPanel Margin="0,14,0,0">
-                                    <ComboBox DockPanel.Dock="Right"
-                                              Width="190"
-                                              ItemsSource="{Binding AutoStartModes}"
-                                              SelectedItem="{Binding AutoStartMode}"
-                                              Style="{StaticResource LightCombo}"/>
-                                    <StackPanel DockPanel.Dock="Left">
-                                        <TextBlock Text="Start with Windows" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
-                                        <TextBlock Text="Off / On / Minimized" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}"/>
-                                    </StackPanel>
-                                </DockPanel>
+                                    <DockPanel Margin="0,14,0,0">
+                                        <ComboBox DockPanel.Dock="Right"
+                                                  Width="190"
+                                                  ItemsSource="{Binding AutoStartModes}"
+                                                  SelectedItem="{Binding AutoStartMode}"
+                                                  Style="{StaticResource LightCombo}"/>
+                                        <StackPanel DockPanel.Dock="Left">
+                                            <TextBlock Text="Start with Windows" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                                            <TextBlock Text="Off / On / Minimized" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}"/>
+                                        </StackPanel>
+                                    </DockPanel>
 
-                                <DockPanel Margin="0,14,0,0">
-                                    <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
-                                                  IsChecked="{Binding MinimizeToTray}"/>
-                                    <StackPanel DockPanel.Dock="Left">
-                                        <TextBlock Text="Minimize to Tray" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
-                                        <TextBlock Text="Close button keeps OnionHop in the tray" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}"/>
-                                    </StackPanel>
-                                </DockPanel>
+                                    <DockPanel Margin="0,14,0,0">
+                                        <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
+                                                      IsChecked="{Binding MinimizeToTray}"/>
+                                        <StackPanel DockPanel.Dock="Left">
+                                            <TextBlock Text="Minimize to Tray" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                                            <TextBlock Text="Close button keeps OnionHop in the tray" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}"/>
+                                        </StackPanel>
+                                    </DockPanel>
 
-                                <DockPanel Margin="0,14,0,0">
-                                    <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
-                                                  IsChecked="{Binding AutoUpdate}"/>
-                                    <StackPanel DockPanel.Dock="Left">
-                                        <TextBlock Text="Auto Update" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
-                                        <TextBlock Text="Check GitHub releases and install updates" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" TextWrapping="Wrap"/>
-                                    </StackPanel>
-                                </DockPanel>
+                                    <DockPanel Margin="0,14,0,0">
+                                        <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
+                                                      IsChecked="{Binding AutoUpdate}"/>
+                                        <StackPanel DockPanel.Dock="Left">
+                                            <TextBlock Text="Auto Update" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                                            <TextBlock Text="Check GitHub releases and install updates" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                    </DockPanel>
 
-                                <DockPanel Margin="0,14,0,0">
-                                    <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
-                                                  IsChecked="{Binding UseNativeTheme}"/>
-                                    <StackPanel DockPanel.Dock="Left">
-                                        <TextBlock Text="Native Windows UI" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
-                                        <TextBlock Text="Use standard window chrome and system colors" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" TextWrapping="Wrap"/>
-                                    </StackPanel>
-                                </DockPanel>
+                                    <DockPanel Margin="0,14,0,0">
+                                        <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
+                                                      IsChecked="{Binding UseNativeTheme}"/>
+                                        <StackPanel DockPanel.Dock="Left">
+                                            <TextBlock Text="Native Windows UI" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                                            <TextBlock Text="Use standard window chrome and system colors" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                    </DockPanel>
 
-                                <DockPanel Margin="0,14,0,0">
-                                    <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
-                                                  IsChecked="{Binding IsDarkMode}"/>
-                                    <StackPanel DockPanel.Dock="Left">
-                                        <TextBlock Text="Dark Mode" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
-                                        <TextBlock Text="Switch theme (also applies in Native UI)" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}"/>
-                                    </StackPanel>
-                                </DockPanel>
+                                    <DockPanel Margin="0,14,0,0">
+                                        <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
+                                                      IsChecked="{Binding IsDarkMode}"/>
+                                        <StackPanel DockPanel.Dock="Left">
+                                            <TextBlock Text="Dark Mode" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                                            <TextBlock Text="Switch theme (also applies in Native UI)" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}"/>
+                                        </StackPanel>
+                                    </DockPanel>
 
-                                <DockPanel Margin="0,14,0,0">
-                                    <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
-                                                  IsChecked="{Binding KillSwitchEnabled}"/>
-                                    <StackPanel DockPanel.Dock="Left">
-                                        <TextBlock Text="Kill Switch" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
-                                        <TextBlock Text="Blocks non-Tor traffic if tunnel drops (Admin + TUN strict)" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" TextWrapping="Wrap"/>
-                                    </StackPanel>
-                                </DockPanel>
+                                    <DockPanel Margin="0,14,0,0">
+                                        <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
+                                                      IsChecked="{Binding KillSwitchEnabled}"/>
+                                        <StackPanel DockPanel.Dock="Left">
+                                            <TextBlock Text="Kill Switch" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                                            <TextBlock Text="Blocks non-Tor traffic if tunnel drops (Admin + TUN strict)" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                    </DockPanel>
 
-                                <DockPanel Margin="0,16,0,0">
-                                    <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
-                                                  IsChecked="{Binding UseTorBridges}"/>
-                                    <StackPanel DockPanel.Dock="Left">
-                                        <TextBlock Text="Tor Bridges" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
-                                        <TextBlock Text="Use pluggable transports when Tor is blocked" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" TextWrapping="Wrap"/>
-                                    </StackPanel>
-                                </DockPanel>
+                                    <DockPanel Margin="0,16,0,0">
+                                        <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
+                                                      IsChecked="{Binding UseTorBridges}"/>
+                                        <StackPanel DockPanel.Dock="Left">
+                                            <TextBlock Text="Tor Bridges" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                                            <TextBlock Text="Use pluggable transports when Tor is blocked" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                    </DockPanel>
 
-                                <Border Margin="0,10,0,0" Background="{DynamicResource CardBackgroundBrush}" CornerRadius="12" Padding="10"
-                                        Visibility="{Binding UseTorBridges, Converter={StaticResource BoolToVis}}">
-                                    <StackPanel>
-                                        <TextBlock Text="Bridge Type" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}" FontSize="12"/>
-                                        <ComboBox Margin="0,6,0,0"
-                                                  ItemsSource="{Binding BridgeTypes}"
-                                                  SelectedItem="{Binding SelectedBridgeType}"
-                                                  Style="{StaticResource LightCombo}"
-                                                  MaxDropDownHeight="200"/>
+                                    <DockPanel Margin="0,14,0,0">
+                                        <ToggleButton Style="{StaticResource ToggleSwitch}" DockPanel.Dock="Right"
+                                                      IsChecked="{Binding UseCensoredMode}"/>
+                                        <StackPanel DockPanel.Dock="Left">
+                                            <TextBlock Text="Censored Network Mode" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                                            <TextBlock Text="Enable SNI bridges + Secure DNS (DoH) for restricted regions" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                    </DockPanel>
 
-                                        <TextBlock Text="Custom bridges (optional, one per line). Leave blank to use the built-in list."
-                                                   FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" Margin="0,10,0,0" TextWrapping="Wrap"/>
-                                        <TextBox Margin="0,6,0,0"
-                                                 Height="110"
-                                                 AcceptsReturn="True"
-                                                 TextWrapping="Wrap"
-                                                 VerticalScrollBarVisibility="Auto"
-                                                 Background="{DynamicResource CardBackgroundBrush}"
-                                                 Foreground="{DynamicResource PrimaryTextBrush}"
-                                                 BorderBrush="{DynamicResource InputBorderBrush}"
-                                                 BorderThickness="1"
-                                                 Padding="8"
-                                                 Text="{Binding CustomBridges}"/>
+                                    <Border Margin="0,10,0,0" Background="{DynamicResource CardBackgroundBrush}" CornerRadius="12" Padding="10"
+                                            Visibility="{Binding UseTorBridges, Converter={StaticResource BoolToVis}}">
+                                        <StackPanel>
+                                            <TextBlock Text="Bridge Type" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}" FontSize="12"/>
+                                            <ComboBox Margin="0,6,0,0"
+                                                      ItemsSource="{Binding BridgeTypes}"
+                                                      SelectedItem="{Binding SelectedBridgeType}"
+                                                      Style="{StaticResource LightCombo}"
+                                                      MaxDropDownHeight="200"/>
 
-                                        <TextBlock Text="Reconnect to apply bridge settings."
-                                                   FontSize="12" Foreground="{DynamicResource TertiaryTextBrush}" Margin="0,8,0,0" TextWrapping="Wrap"/>
-                                    </StackPanel>
-                                </Border>
+                                            <TextBlock Text="Custom bridges (optional, one per line). Leave blank to use the built-in list."
+                                                       FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" Margin="0,10,0,0" TextWrapping="Wrap"/>
+                                            <TextBox Margin="0,6,0,0"
+                                                     Height="110"
+                                                     AcceptsReturn="True"
+                                                     TextWrapping="Wrap"
+                                                     VerticalScrollBarVisibility="Auto"
+                                                     Background="{DynamicResource CardBackgroundBrush}"
+                                                     Foreground="{DynamicResource PrimaryTextBrush}"
+                                                     BorderBrush="{DynamicResource InputBorderBrush}"
+                                                     BorderThickness="1"
+                                                     Padding="8"
+                                                     Text="{Binding CustomBridges}"/>
 
-                                <TextBlock Text="Kill switch changes Windows Firewall rules. If OnionHop crashes while enabled, you may need to relaunch as Administrator to restore." FontSize="12" Foreground="{DynamicResource TertiaryTextBrush}" Margin="0,18,0,0" TextWrapping="Wrap"/>
-                            </StackPanel>
+                                            <TextBlock Text="Reconnect to apply bridge settings."
+                                                       FontSize="12" Foreground="{DynamicResource TertiaryTextBrush}" Margin="0,8,0,0" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                    </Border>
+
+                                    <TextBlock Text="Kill switch changes Windows Firewall rules. If OnionHop crashes while enabled, you may need to relaunch as Administrator to restore." FontSize="12" Foreground="{DynamicResource TertiaryTextBrush}" Margin="0,18,0,0" TextWrapping="Wrap"/>
+                                </StackPanel>
+                            </ScrollViewer>
                         </Border>
                     </Grid>
                     <Button Style="{StaticResource CloseControlButton}" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,-4,-4,0" Click="CloseOverlay_Click">

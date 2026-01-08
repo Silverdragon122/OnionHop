@@ -55,10 +55,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private const string AutoStartModeOff = "Off";
     private const string AutoStartModeOn = "On";
     private const string AutoStartModeMinimized = "On (Minimized)";
+    private const string AutomaticLocationLabel = "Automatic";
+    private const string CensoredBridgePrimary = "snowflake";
+    private const string CensoredBridgeFallback = "meek-azure";
 
     private bool _isConnecting;
     private bool _isConnected;
-    private string _selectedLocation = "United States";
+    private string _selectedLocation = AutomaticLocationLabel;
     private string _statusMessage = "Ready to route traffic through Tor.";
     private string _connectionStatus = "Disconnected";
     private string _currentIp = "--.--.--.--";
@@ -99,6 +102,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     public ObservableCollection<string> Locations { get; } = new()
     {
+        AutomaticLocationLabel,
         "United States",
         "United Kingdom",
         "Germany",
@@ -266,11 +270,34 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             if (SetField(ref _useTorBridges, value))
             {
+                if (!value && _useCensoredMode)
+                {
+                    _useCensoredMode = false;
+                    Raise(nameof(UseCensoredMode));
+                }
                 NotifyBridgeSettingsChanged();
             }
         }
     }
     private bool _useTorBridges;
+
+    public bool UseCensoredMode
+    {
+        get => _useCensoredMode;
+        set
+        {
+            if (SetField(ref _useCensoredMode, value))
+            {
+                if (value)
+                {
+                    ApplyCensoredDefaults();
+                }
+
+                NotifyBridgeSettingsChanged();
+            }
+        }
+    }
+    private bool _useCensoredMode;
 
     public string SelectedBridgeType
     {
@@ -383,14 +410,17 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "- Useful when you want Tor browsing without breaking other apps\n" +
         "\n" +
         "Settings\n" +
-        "- Auto-Connect, Auto-Start (Off/On/Minimized), Minimize to Tray, Auto Update, Dark Mode, Native UI, and Kill Switch are in the Settings tab.\n" +
+        "- Auto-Connect, Auto-Start (Off/On/Minimized), Minimize to Tray, Auto Update, Dark Mode, Native UI, Censored Mode, and Kill Switch are in the Settings tab.\n" +
         "\n" +
         "Exit Location\n" +
-        "- A hint for which country Tor should try to exit from. Not guaranteed.\n" +
+        "- Automatic picks the best exit; country selections are hints only.\n" +
         "\n" +
         "Tor Bridges\n" +
-        "- Use pluggable transports like obfs4 or snowflake when Tor is blocked\n" +
+        "- Use pluggable transports like obfs4, snowflake, or meek-azure when Tor is blocked\n" +
         "- Enable in Settings and reconnect to apply\n" +
+        "\n" +
+        "Censored Network Mode\n" +
+        "- Enables SNI-based bridges (snowflake/meek-azure) and Secure DNS (DoH) for restrictive networks.\n" +
         "\n" +
         "Auto-Connect\n" +
         "- Connect automatically when OnionHop starts.\n" +
@@ -403,6 +433,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "\n" +
         "Auto Update\n" +
         "- Checks GitHub releases and offers updates.\n" +
+        "\n" +
+        "Windows Defender\n" +
+        "- Releases are not code-signed. Defender/SmartScreen may warn; verify the SHA-256 from the release notes.\n" +
         "\n" +
         "Native Windows UI\n" +
         "- Uses standard window chrome; Dark Mode still applies.\n" +
@@ -494,6 +527,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         public string? SelectedConnectionMode { get; set; }
         public bool UseHybridRouting { get; set; }
         public bool UseTorBridges { get; set; }
+        public bool UseCensoredMode { get; set; }
         public string? SelectedBridgeType { get; set; }
         public string? CustomBridges { get; set; }
     }
@@ -608,6 +642,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             }
 
             CustomBridges = settings.CustomBridges ?? string.Empty;
+            UseCensoredMode = settings.UseCensoredMode;
         }
         catch (Exception ex)
         {
@@ -687,6 +722,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             SelectedConnectionMode = SelectedConnectionMode,
             UseHybridRouting = UseHybridRouting,
             UseTorBridges = UseTorBridges,
+            UseCensoredMode = UseCensoredMode,
             SelectedBridgeType = SelectedBridgeType,
             CustomBridges = CustomBridges
         };
@@ -743,6 +779,41 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
+    private void ApplyCensoredDefaults()
+    {
+        if (!UseTorBridges)
+        {
+            UseTorBridges = true;
+        }
+
+        if (HasCustomBridgeLines())
+        {
+            return;
+        }
+
+        var preferred = ResolveCensoredBridgeType();
+        if (!string.IsNullOrWhiteSpace(preferred) &&
+            !string.Equals(SelectedBridgeType, preferred, StringComparison.OrdinalIgnoreCase))
+        {
+            SelectedBridgeType = preferred;
+        }
+    }
+
+    private string? ResolveCensoredBridgeType()
+    {
+        if (BridgeTypes.Contains(CensoredBridgePrimary))
+        {
+            return CensoredBridgePrimary;
+        }
+
+        if (BridgeTypes.Contains(CensoredBridgeFallback))
+        {
+            return CensoredBridgeFallback;
+        }
+
+        return BridgeTypes.FirstOrDefault();
+    }
+
     private void ApplyTheme(bool dark)
     {
         if (UseNativeTheme)
@@ -752,6 +823,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         WindowStyle = WindowStyle.None;
+        ResizeMode = ResizeMode.CanResize;
         var appBg = dark ? Color.FromRgb(12, 16, 26) : Color.FromRgb(233, 237, 245);
         var cardBg = dark ? Color.FromRgb(26, 33, 48) : Colors.White;
         var navBg = dark ? Color.FromRgb(18, 24, 38) : Color.FromRgb(247, 249, 253);
@@ -818,7 +890,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void ApplyNativeTheme(bool dark)
     {
         WindowStyle = WindowStyle.SingleBorderWindow;
-        ResizeMode = ResizeMode.CanMinimize;
+        ResizeMode = ResizeMode.CanResize;
 
         if (dark)
         {
@@ -1620,7 +1692,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         var configDir = Path.Combine(Path.GetTempPath(), "OnionHop", "sing-box");
         Directory.CreateDirectory(configDir);
         var configPath = Path.Combine(configDir, "sing-box.json");
-        await File.WriteAllTextAsync(configPath, BuildSingBoxConfigJson(UseHybridRouting), token);
+        await File.WriteAllTextAsync(configPath, BuildSingBoxConfigJson(UseHybridRouting, UseCensoredMode), token);
 
         AppendLog($"Starting sing-box with config: {configPath}");
 
@@ -1659,7 +1731,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
-    private static string BuildSingBoxConfigJson(bool hybridRouting)
+    private static string BuildSingBoxConfigJson(bool hybridRouting, bool secureDns)
     {
         var rules = new List<object>
         {
@@ -1682,22 +1754,41 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             rules.Add(new { network = "tcp", port = new[] { 80, 443 }, outbound = "tor" });
         }
 
-        object dnsServer = hybridRouting
-             ? new
-             {
-                 tag = "remote",
-                 type = "udp",
-                 server = "1.1.1.1",
-                 server_port = 53
-             }
-             : new
-             {
-                 tag = "remote",
-                 type = "tcp",
-                 server = "1.1.1.1",
-                 server_port = 53,
-                 detour = "tor"
-             };
+        object dnsServer = secureDns
+            ? hybridRouting
+                ? new
+                {
+                    tag = "remote",
+                    type = "https",
+                    server = "cloudflare-dns.com",
+                    server_port = 443,
+                    path = "/dns-query"
+                }
+                : new
+                {
+                    tag = "remote",
+                    type = "https",
+                    server = "cloudflare-dns.com",
+                    server_port = 443,
+                    path = "/dns-query",
+                    detour = "tor"
+                }
+            : hybridRouting
+                ? new
+                {
+                    tag = "remote",
+                    type = "udp",
+                    server = "1.1.1.1",
+                    server_port = 53
+                }
+                : new
+                {
+                    tag = "remote",
+                    type = "tcp",
+                    server = "1.1.1.1",
+                    server_port = 53,
+                    detour = "tor"
+                };
 
         var config = new
         {
@@ -2601,6 +2692,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         return location switch
         {
+            AutomaticLocationLabel => string.Empty,
             "United States" => "us",
             "United Kingdom" => "gb",
             "Germany" => "de",
@@ -2649,6 +2741,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             or nameof(SelectedConnectionMode)
             or nameof(UseHybridRouting)
             or nameof(UseTorBridges)
+            or nameof(UseCensoredMode)
             or nameof(SelectedBridgeType)
             or nameof(CustomBridges))
         {
@@ -2719,6 +2812,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void Window_StateChanged(object? sender, EventArgs e)
     {
         UpdateMaximizeGlyph();
+        if (WindowState == WindowState.Minimized && MinimizeToTray && !_isExiting)
+        {
+            HideToTray();
+        }
     }
 
     private void ToggleWindowState()
