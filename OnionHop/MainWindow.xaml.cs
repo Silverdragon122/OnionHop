@@ -1312,7 +1312,20 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private static Version GetCurrentVersion()
     {
-        return Assembly.GetEntryAssembly()?.GetName().Version ?? new Version(1, 0, 0);
+        var entry = Assembly.GetEntryAssembly();
+        if (entry == null)
+        {
+            return new Version(1, 0, 0);
+        }
+
+        var info = entry.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        var parsed = ParseVersion(info);
+        if (parsed.Major != 0 || parsed.Minor != 0 || parsed.Build != 0)
+        {
+            return parsed;
+        }
+
+        return entry.GetName().Version ?? new Version(1, 0, 0);
     }
 
     private static Version ParseVersion(string? tag)
