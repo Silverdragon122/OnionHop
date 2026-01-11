@@ -17,8 +17,8 @@
         <shell:WindowChrome x:Name="CustomWindowChrome"
                             CaptionHeight="0"
                             ResizeBorderThickness="6"
-                            CornerRadius="0"
-                            GlassFrameThickness="-1"
+                            CornerRadius="14"
+                            GlassFrameThickness="0"
                             UseAeroCaptionButtons="False"/>
     </shell:WindowChrome.WindowChrome>
     <Window.Resources>
@@ -580,6 +580,11 @@
                                     <Button Style="{StaticResource SegmentedButton}" Width="120" Click="RefreshIpButton_Click">Refresh IP</Button>
                                     <Button Style="{StaticResource SegmentedButton}" Width="120" Margin="10,0,0,0" Click="DisconnectButton_Click">Disconnect</Button>
                                 </StackPanel>
+                                <Button Style="{StaticResource SegmentedButton}" Width="250" Margin="0,10,0,0"
+                                        Click="ChangeIdentityButton_Click"
+                                        IsEnabled="{Binding CanChangeIdentity}">
+                                    Change Identity
+                                </Button>
                                 <TextBlock Text="Use refresh to verify your Tor exit node once connected." FontSize="12" Foreground="{DynamicResource TertiaryTextBrush}" Margin="0,10,0,0" TextWrapping="Wrap"/>
                             </StackPanel>
                         </Border>
@@ -740,6 +745,8 @@
                                                       SelectedItem="{Binding SelectedBridgeType}"
                                                       Style="{StaticResource LightCombo}"
                                                       MaxDropDownHeight="200"/>
+                                            <TextBlock Text="Webtunnel bridges are fetched from BridgeDB when selected (unless you provide custom lines)."
+                                                       FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" Margin="0,8,0,0" TextWrapping="Wrap"/>
 
                                             <TextBlock Text="Custom bridges (optional, one per line). Leave blank to use the built-in list."
                                                        FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" Margin="0,10,0,0" TextWrapping="Wrap"/>

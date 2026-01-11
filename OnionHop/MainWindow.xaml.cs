@@ -5,7 +5,9 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Principal;
 using System.Runtime.CompilerServices;
@@ -59,6 +61,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private const string AutomaticLocationLabel = "Automatic";
     private const string CensoredBridgePrimary = "snowflake";
     private const string CensoredBridgeFallback = "meek-azure";
+    private const string WebTunnelBridgeType = "webtunnel";
+    private const string BridgeDbWebTunnelUrl = "https://bridges.torproject.org/bridges?transport=webtunnel";
+    private const string ControlPortFileName = "control_port.txt";
+    private const string ControlAuthCookieFileName = "control_auth_cookie";
 
     private bool _isConnecting;
     private bool _isConnected;
@@ -74,6 +80,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private CancellationTokenSource? _connectCts;
     private TaskCompletionSource<bool>? _bootstrapSource;
     private PluggableTransportConfig? _ptConfig;
+    private string? _torDataDirectory;
+    private int? _torControlPort;
+    private DateTime _lastNewnymUtc = DateTime.MinValue;
+    private readonly SemaphoreSlim _webTunnelLock = new(1, 1);
+    private IReadOnlyList<string>? _webTunnelCache;
+    private DateTime _webTunnelCacheUtc;
 
     private DateTime _lastVpnMessageUtc = DateTime.MinValue;
     private readonly object _singBoxLogLock = new();
@@ -99,6 +111,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private System.Windows.Forms.NotifyIcon? _trayIcon;
     private System.Drawing.Icon? _trayIconImage;
     private WindowChrome? _customChrome;
+    private bool _startHiddenToTray;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -418,8 +431,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "- Automatic picks the best exit; country selections are hints only.\n" +
         "\n" +
         "Tor Bridges\n" +
-        "- Use pluggable transports like obfs4, snowflake, or meek-azure when Tor is blocked\n" +
+        "- Use pluggable transports like obfs4, snowflake, meek-azure, or webtunnel when Tor is blocked\n" +
+        "- Webtunnel bridges are fetched from BridgeDB unless you provide custom lines\n" +
         "- Enable in Settings and reconnect to apply\n" +
+        "\n" +
+        "Change Identity\n" +
+        "- Action Center button requests a new Tor circuit (like Tor Browser). It can take a few seconds to reflect.\n" +
         "\n" +
         "Censored Network Mode\n" +
         "- Enables SNI-based bridges (snowflake/meek-azure) and Secure DNS (DoH) for restrictive networks.\n" +
@@ -484,6 +501,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             : "Connect";
     private bool _isDisconnecting;
 
+    public bool CanChangeIdentity => _isConnected && !_isConnecting;
+
     public MainWindow()
     {
         InitializeComponent();
@@ -493,6 +512,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         LoadBridgeConfig();
         LoadUserSettings();
         ApplyStartupArguments(Environment.GetCommandLineArgs());
+        PrepareStartupVisibility();
         ApplyTheme(IsDarkMode);
         UpdateConnectVisualState();
         UpdateMaximizeGlyph();
@@ -577,6 +597,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             bridgeKeys.AddRange(new[] { "obfs4", "snowflake", "meek-azure" });
         }
+
+        if (!bridgeKeys.Any(key => string.Equals(key, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase)))
+        {
+            bridgeKeys.Add(WebTunnelBridgeType);
+        }
+
+        bridgeKeys = bridgeKeys
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(key => key, StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
         BridgeTypes.Clear();
         foreach (var key in bridgeKeys)
@@ -1076,6 +1106,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1, ref value, sizeof(int));
     }
 
+    private void PrepareStartupVisibility()
+    {
+        if (_startMinimizedOnLaunch && MinimizeToTray)
+        {
+            _startHiddenToTray = true;
+            ShowInTaskbar = false;
+            Opacity = 0;
+        }
+    }
+
     private void EnsureTrayIcon()
     {
         if (_trayIcon != null)
@@ -1129,27 +1169,40 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return (System.Drawing.Icon)System.Drawing.SystemIcons.Application.Clone();
     }
 
-    private void HideToTray()
+    private void HideToTray(bool showBalloon = true)
     {
-        EnsureTrayIcon();
-        if (_trayIcon != null)
+        try
         {
-            _trayIcon.Visible = true;
-            if (!_trayBalloonShown)
+            EnsureTrayIcon();
+            if (_trayIcon != null)
             {
-                _trayBalloonShown = true;
-                _trayIcon.BalloonTipTitle = "OnionHop";
-                _trayIcon.BalloonTipText = "OnionHop is still running in the tray.";
-                _trayIcon.ShowBalloonTip(2000);
+                _trayIcon.Visible = true;
+                if (showBalloon && !_trayBalloonShown)
+                {
+                    _trayBalloonShown = true;
+                    _trayIcon.BalloonTipTitle = "OnionHop";
+                    _trayIcon.BalloonTipText = "OnionHop is still running in the tray.";
+                    _trayIcon.ShowBalloonTip(2000);
+                }
             }
-        }
 
-        ShowInTaskbar = false;
-        Hide();
+            ShowInTaskbar = false;
+            Hide();
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Minimize to tray failed: {ex.Message}");
+            StatusMessage = "Minimize to tray failed; disabling it.";
+            MinimizeToTray = false;
+            Opacity = 1;
+            ShowInTaskbar = true;
+            WindowState = WindowState.Minimized;
+        }
     }
 
     private void ShowFromTray()
     {
+        Opacity = 1;
         ShowInTaskbar = true;
         Show();
         if (WindowState == WindowState.Minimized)
@@ -1166,6 +1219,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     public void RestoreFromExternalActivation()
     {
+        Opacity = 1;
         if (MinimizeToTray)
         {
             ShowInTaskbar = true;
@@ -1219,12 +1273,17 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             if (MinimizeToTray)
             {
-                HideToTray();
+                HideToTray(showBalloon: false);
             }
             else
             {
                 WindowState = WindowState.Minimized;
             }
+        }
+        if (_startHiddenToTray)
+        {
+            Opacity = 1;
+            _startHiddenToTray = false;
         }
 
         if (AutoConnect)
@@ -1490,6 +1549,48 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private async void DisconnectButton_Click(object sender, RoutedEventArgs e)
     {
         await DisconnectAsync();
+    }
+
+    private async void ChangeIdentityButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_isConnected || _torProcess == null)
+        {
+            StatusMessage = "Connect to Tor before requesting a new identity.";
+            return;
+        }
+
+        if (DateTime.UtcNow - _lastNewnymUtc < TimeSpan.FromSeconds(10))
+        {
+            StatusMessage = "Please wait a moment before requesting another identity.";
+            return;
+        }
+
+        StatusMessage = "Requesting a new Tor circuit...";
+
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+            var success = await SendTorControlSignalAsync("SIGNAL NEWNYM", cts.Token);
+            if (!success)
+            {
+                StatusMessage = "Unable to request a new identity. Check Tor is running.";
+                return;
+            }
+
+            _lastNewnymUtc = DateTime.UtcNow;
+            await Task.Delay(1200);
+            await UpdateCurrentIpAsync();
+            StatusMessage = "New identity requested. It may take a few seconds to update.";
+        }
+        catch (OperationCanceledException)
+        {
+            StatusMessage = "Identity request timed out.";
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Change identity failed: {ex.Message}");
+            StatusMessage = $"Failed to change identity: {ex.Message}";
+        }
     }
 
     private async Task ConnectAsync()
@@ -2151,12 +2252,21 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return ExtractBridgeLines(CustomBridges).Count > 0;
     }
 
-    private IReadOnlyList<string> GetBridgeLines()
+    private async Task<IReadOnlyList<string>> GetBridgeLinesAsync(CancellationToken token)
     {
         var custom = ExtractBridgeLines(CustomBridges);
         if (custom.Count > 0)
         {
             return custom;
+        }
+
+        if (string.Equals(SelectedBridgeType, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase))
+        {
+            var webtunnelLines = await GetWebTunnelBridgeLinesAsync(token);
+            if (webtunnelLines.Count > 0)
+            {
+                return webtunnelLines;
+            }
         }
 
         if (_ptConfig?.Bridges != null &&
@@ -2167,6 +2277,54 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         return Array.Empty<string>();
+    }
+
+    private async Task<IReadOnlyList<string>> GetWebTunnelBridgeLinesAsync(CancellationToken token)
+    {
+        await _webTunnelLock.WaitAsync(token);
+        try
+        {
+            if (_webTunnelCache != null &&
+                DateTime.UtcNow - _webTunnelCacheUtc < TimeSpan.FromHours(8))
+            {
+                return _webTunnelCache;
+            }
+
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(12) };
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("OnionHop");
+
+            using var response = await client.GetAsync(BridgeDbWebTunnelUrl, token);
+            if (!response.IsSuccessStatusCode)
+            {
+                AppendLog($"Webtunnel bridge fetch failed: {(int)response.StatusCode} {response.ReasonPhrase}");
+                return Array.Empty<string>();
+            }
+
+            var html = await response.Content.ReadAsStringAsync(token);
+            var lines = ExtractBridgeLinesFromHtml(html, WebTunnelBridgeType);
+            if (lines.Count == 0)
+            {
+                AppendLog("Webtunnel bridge fetch returned no usable lines.");
+                return Array.Empty<string>();
+            }
+
+            _webTunnelCache = lines;
+            _webTunnelCacheUtc = DateTime.UtcNow;
+            return lines;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Webtunnel bridge fetch failed: {ex.Message}");
+            return Array.Empty<string>();
+        }
+        finally
+        {
+            _webTunnelLock.Release();
+        }
     }
 
     private static List<string> ExtractBridgeLines(string? text)
@@ -2201,6 +2359,41 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         return results;
+    }
+
+    private static IReadOnlyList<string> ExtractBridgeLinesFromHtml(string html, string transport)
+    {
+        if (string.IsNullOrWhiteSpace(html))
+        {
+            return Array.Empty<string>();
+        }
+
+        var matches = Regex.Matches(html, $"{Regex.Escape(transport)}\\s+[^<\\r\\n]+", RegexOptions.IgnoreCase);
+        if (matches.Count == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        var lines = new List<string>(matches.Count);
+        foreach (Match match in matches)
+        {
+            var line = WebUtility.HtmlDecode(match.Value).Trim();
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            if (line.StartsWith("Bridge ", StringComparison.OrdinalIgnoreCase))
+            {
+                line = line.Substring("Bridge ".Length).Trim();
+            }
+
+            lines.Add(line);
+        }
+
+        return lines
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
     }
 
     private IReadOnlyList<string> GetClientTransportPlugins(IReadOnlyList<string> bridgeLines, string torDir)
@@ -2330,22 +2523,33 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         var dataDir = Path.Combine(Path.GetTempPath(), "OnionHop", "tor-data");
         Directory.CreateDirectory(dataDir);
+        _torDataDirectory = dataDir;
+        _torControlPort = null;
+        var controlPortFile = Path.Combine(dataDir, ControlPortFileName);
+        TryDeleteFile(controlPortFile);
+        TryDeleteFile(Path.Combine(dataDir, ControlAuthCookieFileName));
 
         var argsBuilder = new StringBuilder();
         argsBuilder.Append($"--SocksPort {SocksPort} ");
         argsBuilder.Append($"--DataDirectory \"{dataDir}\" ");
         argsBuilder.Append("--ClientOnly 1 ");
         argsBuilder.Append("--Log \"notice stdout\" ");
+        argsBuilder.Append("--CookieAuthentication 1 ");
+        argsBuilder.Append("--ControlPort auto ");
+        argsBuilder.Append($"--ControlPortWriteToFile \"{controlPortFile}\" ");
         var torDir = Path.GetDirectoryName(torPath) ?? AppContext.BaseDirectory;
         argsBuilder.Append($"--GeoIPFile \"{Path.Combine(torDir, "geoip")}\" ");
         argsBuilder.Append($"--GeoIPv6File \"{Path.Combine(torDir, "geoip6")}\" ");
 
         if (UseTorBridges)
         {
-            var bridgeLines = GetBridgeLines();
+            var bridgeLines = await GetBridgeLinesAsync(token);
             if (bridgeLines.Count == 0)
             {
-                throw new InvalidOperationException("Bridges enabled but no bridge lines are configured.");
+                var message = string.Equals(SelectedBridgeType, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase)
+                    ? "Webtunnel bridges could not be fetched. Paste custom bridges or try again."
+                    : "Bridges enabled but no bridge lines are configured.";
+                throw new InvalidOperationException(message);
             }
 
             var pluginLines = GetClientTransportPlugins(bridgeLines, torDir);
@@ -2401,6 +2605,154 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _torProcess.BeginErrorReadLine();
 
         await _bootstrapSource.Task;
+    }
+
+    private async Task<bool> SendTorControlSignalAsync(string command, CancellationToken token)
+    {
+        var port = await GetTorControlPortAsync(token);
+        if (!port.HasValue)
+        {
+            AppendLog("Tor control port not available.");
+            return false;
+        }
+
+        var cookie = await GetTorControlCookieHexAsync(token);
+        if (string.IsNullOrWhiteSpace(cookie))
+        {
+            AppendLog("Tor control cookie not available.");
+            return false;
+        }
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, port.Value, token);
+
+        await using var stream = client.GetStream();
+        using var reader = new StreamReader(stream, Encoding.ASCII);
+        using var writer = new StreamWriter(stream, Encoding.ASCII)
+        {
+            NewLine = "\r\n",
+            AutoFlush = true
+        };
+
+        await writer.WriteLineAsync($"AUTHENTICATE {cookie}");
+        var authResponse = await ReadControlResponseAsync(reader);
+        if (!authResponse.StartsWith("250", StringComparison.Ordinal))
+        {
+            AppendLog($"Tor control auth failed: {authResponse}");
+            return false;
+        }
+
+        await writer.WriteLineAsync(command);
+        var response = await ReadControlResponseAsync(reader);
+        if (!response.StartsWith("250", StringComparison.Ordinal))
+        {
+            AppendLog($"Tor control command failed: {response}");
+            return false;
+        }
+
+        await writer.WriteLineAsync("QUIT");
+        return true;
+    }
+
+    private async Task<int?> GetTorControlPortAsync(CancellationToken token)
+    {
+        if (_torControlPort.HasValue)
+        {
+            return _torControlPort.Value;
+        }
+
+        if (string.IsNullOrWhiteSpace(_torDataDirectory))
+        {
+            return null;
+        }
+
+        var portFile = Path.Combine(_torDataDirectory, ControlPortFileName);
+        for (var attempt = 0; attempt < 12; attempt++)
+        {
+            if (File.Exists(portFile))
+            {
+                var content = await File.ReadAllTextAsync(portFile, token);
+                var parsed = ParsePortFromFile(content);
+                if (parsed.HasValue)
+                {
+                    _torControlPort = parsed.Value;
+                    return _torControlPort;
+                }
+            }
+
+            await Task.Delay(200, token);
+        }
+
+        return null;
+    }
+
+    private async Task<string?> GetTorControlCookieHexAsync(CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(_torDataDirectory))
+        {
+            return null;
+        }
+
+        var cookiePath = Path.Combine(_torDataDirectory, ControlAuthCookieFileName);
+        for (var attempt = 0; attempt < 12; attempt++)
+        {
+            if (File.Exists(cookiePath))
+            {
+                var bytes = await File.ReadAllBytesAsync(cookiePath, token);
+                if (bytes.Length > 0)
+                {
+                    return BitConverter.ToString(bytes).Replace("-", string.Empty).ToLowerInvariant();
+                }
+            }
+
+            await Task.Delay(200, token);
+        }
+
+        return null;
+    }
+
+    private static async Task<string> ReadControlResponseAsync(StreamReader reader)
+    {
+        var line = await reader.ReadLineAsync() ?? string.Empty;
+        if (!line.StartsWith("250-", StringComparison.Ordinal))
+        {
+            return line;
+        }
+
+        var current = line;
+        while (current.StartsWith("250-", StringComparison.Ordinal))
+        {
+            var next = await reader.ReadLineAsync();
+            if (next == null)
+            {
+                break;
+            }
+
+            current = next;
+            if (current.StartsWith("250 ", StringComparison.Ordinal))
+            {
+                break;
+            }
+        }
+
+        return current;
+    }
+
+    private static int? ParsePortFromFile(string content)
+    {
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            return null;
+        }
+
+        var matches = Regex.Matches(content, @"\d+");
+        if (matches.Count == 0)
+        {
+            return null;
+        }
+
+        var match = matches[^1];
+        return int.TryParse(match.Value, out var port) ? port : null;
     }
 
     private void OnTorDataReceived(object? sender, DataReceivedEventArgs e)
@@ -2548,6 +2900,23 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             _torProcess.ErrorDataReceived -= OnTorDataReceived;
             _torProcess.Dispose();
             _torProcess = null;
+            _torControlPort = null;
+            _torDataDirectory = null;
+            _lastNewnymUtc = DateTime.MinValue;
+        }
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
         }
     }
 
@@ -2910,6 +3279,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         fill.GradientStops[0].Color = inner;
         fill.GradientStops[1].Color = outer;
         glow.Color = shadow;
+
+        Raise(nameof(CanChangeIdentity));
     }
 
     [DllImport("wininet.dll", SetLastError = true)]
