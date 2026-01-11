@@ -8,6 +8,8 @@ $TorVersion = "14.0.4"
 $TorUrl = "https://archive.torproject.org/tor-package-archive/torbrowser/$TorVersion/tor-expert-bundle-windows-x86_64-$TorVersion.tar.gz"
 $SingBoxApiUrl = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
 $WintunUrl = "https://www.wintun.net/builds/wintun-0.14.1.zip"
+$WebTunnelVersion = "v0.0.3"
+$WebTunnelSourceUrl = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/archive/$WebTunnelVersion/webtunnel-$WebTunnelVersion.tar.gz"
 
 $RepoRoot = $PSScriptRoot
 $TorDir = Join-Path $RepoRoot "OnionHop\tor"
@@ -42,7 +44,7 @@ try {
     Ensure-Dir $PtDir
 
     # --- 1. Tor Expert Bundle ---
-    Write-Host "`n[1/3] Downloading Tor Expert Bundle ($TorVersion)..."
+    Write-Host "`n[1/4] Downloading Tor Expert Bundle ($TorVersion)..."
     $TorArchive = Join-Path $TempDir "tor.tar.gz"
     try {
         Invoke-WebRequest -Uri $TorUrl -OutFile $TorArchive
@@ -90,8 +92,80 @@ try {
         Rename-Item -Path (Join-Path $PtDir "obfs4proxy.exe") -NewName "lyrebird.exe" -Force
     }
 
-    # --- 2. Sing-box ---
-    Write-Host "`n[2/3] Fetching Sing-box..."
+    # --- 2. Webtunnel client ---
+    Write-Host "`n[2/4] Preparing webtunnel-client..."
+    # Build webtunnel-client from source if Go is available; otherwise try Tor Browser copy.
+    $WebTunnelClientName = "webtunnel-client.exe"
+    $WebTunnelOutput = Join-Path $PtDir $WebTunnelClientName
+    $WebTunnelBuilt = $false
+    $GoCommand = Get-Command "go" -ErrorAction SilentlyContinue
+    if ($GoCommand) {
+        try {
+            Write-Host "Building webtunnel-client from source ($WebTunnelVersion)..."
+            $WebTunnelArchive = Join-Path $TempDir "webtunnel.tar.gz"
+            Invoke-WebRequest -Uri $WebTunnelSourceUrl -OutFile $WebTunnelArchive
+            tar -xf $WebTunnelArchive -C $TempDir
+            $WebTunnelDir = Get-ChildItem -Path $TempDir -Directory | Where-Object { $_.Name -like "webtunnel-*" } | Select-Object -First 1
+            if (-not $WebTunnelDir) { throw "WebTunnel extraction failed." }
+
+            $prevCgo = $env:CGO_ENABLED
+            $prevGoos = $env:GOOS
+            $prevGoarch = $env:GOARCH
+            $env:CGO_ENABLED = "0"
+            $env:GOOS = "windows"
+            $env:GOARCH = "amd64"
+            Push-Location $WebTunnelDir.FullName
+            go build -ldflags "-s -w" -o $WebTunnelOutput ".\\main\\client"
+            Pop-Location
+            $env:CGO_ENABLED = $prevCgo
+            $env:GOOS = $prevGoos
+            $env:GOARCH = $prevGoarch
+
+            if (Test-Path $WebTunnelOutput) {
+                Write-Host "Built webtunnel-client.exe."
+                $WebTunnelBuilt = $true
+            }
+        } catch {
+            Write-Warning "Webtunnel build failed: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Warning "Go not found. Skipping webtunnel build."
+    }
+
+    if (-not $WebTunnelBuilt -and -not (Test-Path $WebTunnelOutput)) {
+        $WebTunnelCandidates = @(
+            (Join-Path $env:LOCALAPPDATA "Tor Browser\Browser\TorBrowser\Tor\PluggableTransports\$WebTunnelClientName"),
+            (Join-Path ${env:ProgramFiles} "Tor Browser\Browser\TorBrowser\Tor\PluggableTransports\$WebTunnelClientName"),
+            (Join-Path ${env:ProgramFiles(x86)} "Tor Browser\Browser\TorBrowser\Tor\PluggableTransports\$WebTunnelClientName")
+        ) | Where-Object { $_ -and (Test-Path $_) }
+
+        $WebTunnelSource = $WebTunnelCandidates | Select-Object -First 1
+        if ($WebTunnelSource) {
+            Copy-Item $WebTunnelSource $PtDir -Force
+            Write-Host "Copied webtunnel-client.exe from Tor Browser."
+        } else {
+            Write-Warning "webtunnel-client.exe not found. Install Go to build it, or install Tor Browser and copy it into $PtDir."
+        }
+    }
+
+    $PtConfigPath = Join-Path $PtDir "pt_config.json"
+    if (Test-Path $PtConfigPath) {
+        $ptConfig = Get-Content $PtConfigPath -Raw | ConvertFrom-Json
+        if ($null -ne $ptConfig.pluggableTransports) {
+            if ($ptConfig.pluggableTransports -is [System.Collections.IDictionary]) {
+                $ptConfig.pluggableTransports["lyrebird"] = "ClientTransportPlugin meek_lite,obfs2,obfs3,obfs4,scramblesuit exec `${pt_path}lyrebird.exe"
+                $ptConfig.pluggableTransports["webtunnel"] = "ClientTransportPlugin webtunnel exec `${pt_path}webtunnel-client.exe"
+            } else {
+                $ptConfig.pluggableTransports | Add-Member -NotePropertyName "lyrebird" -NotePropertyValue "ClientTransportPlugin meek_lite,obfs2,obfs3,obfs4,scramblesuit exec `${pt_path}lyrebird.exe" -Force
+                $ptConfig.pluggableTransports | Add-Member -NotePropertyName "webtunnel" -NotePropertyValue "ClientTransportPlugin webtunnel exec `${pt_path}webtunnel-client.exe" -Force
+            }
+        }
+        $ptConfig | ConvertTo-Json -Depth 6 | Set-Content -Path $PtConfigPath
+        Write-Host "Updated pt_config.json for webtunnel-client."
+    }
+
+    # --- 3. Sing-box ---
+    Write-Host "`n[3/4] Fetching Sing-box..."
     $SbRelease = Invoke-RestMethod -Uri $SingBoxApiUrl
     $SbAsset = $SbRelease.assets | Where-Object { $_.name -like "*windows-amd64.zip" } | Select-Object -First 1
     if (-not $SbAsset) { throw "No windows-amd64 asset found." }
@@ -106,8 +180,8 @@ try {
     $SbExtractedDir = Get-ChildItem -Path $TempDir -Directory | Where-Object { $_.Name -like "sing-box-*" } | Select-Object -First 1
     Copy-Item (Join-Path $SbExtractedDir.FullName "sing-box.exe") $VpnDir -Force
 
-    # --- 3. Wintun ---
-    Write-Host "`n[3/3] Downloading Wintun..."
+    # --- 4. Wintun ---
+    Write-Host "`n[4/4] Downloading Wintun..."
     $WintunArchive = Join-Path $TempDir "wintun.zip"
     Invoke-WebRequest -Uri $WintunUrl -OutFile $WintunArchive
     

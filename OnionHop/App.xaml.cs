@@ -47,6 +47,50 @@ public partial class App : System.Windows.Application
         base.OnExit(e);
     }
 
+    public void ReleaseSingleInstance()
+    {
+        _activationCts?.Cancel();
+        _activationEvent?.Dispose();
+        _activationEvent = null;
+        _activationCts = null;
+
+        if (_instanceMutex != null)
+        {
+            try
+            {
+                _instanceMutex.ReleaseMutex();
+            }
+            catch
+            {
+            }
+
+            _instanceMutex.Dispose();
+            _instanceMutex = null;
+        }
+    }
+
+    public bool TryReacquireSingleInstance()
+    {
+        if (_instanceMutex != null)
+        {
+            return true;
+        }
+
+        var createdNew = false;
+        _instanceMutex = new Mutex(true, SingleInstanceMutexName, out createdNew);
+        if (!createdNew)
+        {
+            _instanceMutex.Dispose();
+            _instanceMutex = null;
+            return false;
+        }
+
+        _activationEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ActivateEventName);
+        _activationCts = new CancellationTokenSource();
+        StartActivationListener(_activationEvent, _activationCts.Token);
+        return true;
+    }
+
     private void StartActivationListener(EventWaitHandle activationEvent, CancellationToken token)
     {
         _ = Task.Run(() =>

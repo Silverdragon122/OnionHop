@@ -62,9 +62,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private const string CensoredBridgePrimary = "snowflake";
     private const string CensoredBridgeFallback = "meek-azure";
     private const string WebTunnelBridgeType = "webtunnel";
-    private const string BridgeDbWebTunnelUrl = "https://bridges.torproject.org/bridges?transport=webtunnel";
     private const string ControlPortFileName = "control_port.txt";
     private const string ControlAuthCookieFileName = "control_auth_cookie";
+    private const string WebTunnelClientFileName = "webtunnel-client.exe";
 
     private bool _isConnecting;
     private bool _isConnected;
@@ -83,9 +83,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private string? _torDataDirectory;
     private int? _torControlPort;
     private DateTime _lastNewnymUtc = DateTime.MinValue;
-    private readonly SemaphoreSlim _webTunnelLock = new(1, 1);
-    private IReadOnlyList<string>? _webTunnelCache;
-    private DateTime _webTunnelCacheUtc;
+    private readonly DateTime _appStartUtc = DateTime.UtcNow;
+    private DateTime? _lastConnectAttemptUtc;
+    private bool _autoRetryConnectUsed;
+    private bool _pendingAutoRetry;
+    private string? _bridgeValidationMessage;
 
     private DateTime _lastVpnMessageUtc = DateTime.MinValue;
     private readonly object _singBoxLogLock = new();
@@ -407,7 +409,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public bool IsOverlayVisible => ShowLogs || ShowAbout || ShowSettings;
 
     public string AboutText =>
-        "OnionHop Modes\n" +
+        "=== Modes ===\n" +
         "\n" +
         "Proxy Mode (Recommended)\n" +
         "- Starts Tor (SOCKS5 on 127.0.0.1:9050)\n" +
@@ -424,16 +426,28 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "- In TUN mode, only browsers are routed through Tor; everything else goes direct\n" +
         "- Useful when you want Tor browsing without breaking other apps\n" +
         "\n" +
-        "Settings\n" +
+        "=== Settings ===\n" +
+        "\n" +
         "- Auto-Connect, Auto-Start (Off/On/Minimized), Minimize to Tray, Auto Update, Dark Mode, Native UI, Censored Mode, and Kill Switch are in the Settings tab.\n" +
+        "- Exit Location: Automatic picks the best exit; country selections are hints only.\n" +
         "\n" +
-        "Exit Location\n" +
-        "- Automatic picks the best exit; country selections are hints only.\n" +
+        "=== Tor Bridges ===\n" +
         "\n" +
-        "Tor Bridges\n" +
-        "- Use pluggable transports like obfs4, snowflake, meek-azure, or webtunnel when Tor is blocked\n" +
-        "- Webtunnel bridges are fetched from BridgeDB unless you provide custom lines\n" +
-        "- Enable in Settings and reconnect to apply\n" +
+        "- Use pluggable transports like obfs4, snowflake, meek-azure, or webtunnel when Tor is blocked.\n" +
+        "- Webtunnel needs webtunnel-client.exe (bundled with Tor Browser).\n" +
+        "- Webtunnel works best with real BridgeDB lines (example/test-net lines may not work).\n" +
+        "- If the website only shows example lines, use the email method below.\n" +
+        "- Enable in Settings and reconnect to apply.\n" +
+        "\n" +
+        "Webtunnel tutorial (BridgeDB)\n" +
+        "1) Visit https://bridges.torproject.org/\n" +
+        "2) Request bridges and choose transport: webtunnel.\n" +
+        "3) If you only see example/test-net lines (2001:db8/192.0.2/etc), email bridges@torproject.org with body \"get transport webtunnel\".\n" +
+        "4) Copy the real webtunnel bridge lines you receive.\n" +
+        "5) Paste them into Settings -> Tor Bridges -> Custom bridges.\n" +
+        "6) Reconnect.\n" +
+        "\n" +
+        "=== Actions ===\n" +
         "\n" +
         "Change Identity\n" +
         "- Action Center button requests a new Tor circuit (like Tor Browser). It can take a few seconds to reflect.\n" +
@@ -452,6 +466,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "\n" +
         "Auto Update\n" +
         "- Checks GitHub releases and offers updates.\n" +
+        "\n" +
+        "=== Safety ===\n" +
         "\n" +
         "Windows Defender\n" +
         "- Releases are not code-signed. Defender/SmartScreen may warn; verify the SHA-256 from the release notes.\n" +
@@ -1605,6 +1621,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             return;
         }
 
+        _lastConnectAttemptUtc = DateTime.UtcNow;
+        _bridgeValidationMessage = null;
         _isDisconnecting = false;
         UpdateConnectVisualState();
         Raise(nameof(ConnectButtonText));
@@ -1680,6 +1698,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             StatusBrush = new SolidColorBrush(Color.FromRgb(209, 67, 75));
             ConnectionProgress = 0;
             StopTorProcess();
+
+            if (ShouldAutoRetryConnect())
+            {
+                AppendLog("Initial connect timed out quickly; retrying once...");
+                StatusMessage = "Initial connect timed out. Retrying once...";
+                _pendingAutoRetry = true;
+            }
         }
         catch (Exception ex)
         {
@@ -1690,6 +1715,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             StatusBrush = new SolidColorBrush(Color.FromRgb(209, 67, 75));
             ConnectionProgress = 0;
             StopTorProcess();
+
+            if (ShouldAutoRetryConnect())
+            {
+                AppendLog("Initial connect failed quickly; retrying once...");
+                StatusMessage = "Initial connect failed. Retrying once...";
+                _pendingAutoRetry = true;
+            }
         }
         finally
         {
@@ -1698,7 +1730,45 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             UpdateConnectVisualState();
             _connectCts?.Dispose();
             _connectCts = null;
+
+            if (_pendingAutoRetry)
+            {
+                _pendingAutoRetry = false;
+                _ = Dispatcher.BeginInvoke(new Action(() => _ = RetryConnectAsync()));
+            }
         }
+    }
+
+    private bool ShouldAutoRetryConnect()
+    {
+        if (_autoRetryConnectUsed)
+        {
+            return false;
+        }
+
+        if (_lastConnectAttemptUtc == null)
+        {
+            return false;
+        }
+
+        if (DateTime.UtcNow - _appStartUtc > TimeSpan.FromMinutes(5))
+        {
+            return false;
+        }
+
+        if (DateTime.UtcNow - _lastConnectAttemptUtc.Value > TimeSpan.FromSeconds(15))
+        {
+            return false;
+        }
+
+        _autoRetryConnectUsed = true;
+        return true;
+    }
+
+    private async Task RetryConnectAsync()
+    {
+        await Task.Delay(1500);
+        await ConnectAsync();
     }
 
     private async Task DisconnectAsync()
@@ -2188,18 +2258,38 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         try
         {
+            if (Application.Current is App app)
+            {
+                app.ReleaseSingleInstance();
+            }
+
             var psi = new ProcessStartInfo(exePath)
             {
                 UseShellExecute = true,
                 Verb = "runas",
                 Arguments = args.ToString()
             };
-            Process.Start(psi);
+            var started = Process.Start(psi);
+            if (started == null)
+            {
+                if (Application.Current is App retryApp)
+                {
+                    retryApp.TryReacquireSingleInstance();
+                }
+
+                StatusMessage = "Unable to relaunch as Administrator.";
+                return false;
+            }
             Application.Current.Shutdown();
             return false;
         }
         catch
         {
+            if (Application.Current is App retryApp)
+            {
+                retryApp.TryReacquireSingleInstance();
+            }
+
             StatusMessage = "VPN mode requires Administrator permission.";
             return false;
         }
@@ -2252,79 +2342,39 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return ExtractBridgeLines(CustomBridges).Count > 0;
     }
 
-    private async Task<IReadOnlyList<string>> GetBridgeLinesAsync(CancellationToken token)
+    private Task<IReadOnlyList<string>> GetBridgeLinesAsync(CancellationToken token)
     {
         var custom = ExtractBridgeLines(CustomBridges);
         if (custom.Count > 0)
         {
-            return custom;
-        }
-
-        if (string.Equals(SelectedBridgeType, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase))
-        {
-            var webtunnelLines = await GetWebTunnelBridgeLinesAsync(token);
-            if (webtunnelLines.Count > 0)
+            if (string.Equals(SelectedBridgeType, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase))
             {
-                return webtunnelLines;
+                var filtered = custom.Where(line => !IsPlaceholderBridgeLine(line)).ToList();
+                if (filtered.Count == 0)
+                {
+                    AppendLog("Webtunnel bridge lines look like examples (2001:db8/192.0.2/etc). Attempting anyway.");
+                    return Task.FromResult<IReadOnlyList<string>>(custom);
+                }
+
+                if (filtered.Count != custom.Count)
+                {
+                    AppendLog("Removed example WebTunnel bridge lines (use real BridgeDB entries).");
+                }
+
+                return Task.FromResult<IReadOnlyList<string>>(filtered);
             }
+
+            return Task.FromResult<IReadOnlyList<string>>(custom);
         }
 
         if (_ptConfig?.Bridges != null &&
             _ptConfig.Bridges.TryGetValue(SelectedBridgeType, out var bridges) &&
             bridges.Count > 0)
         {
-            return bridges;
+            return Task.FromResult<IReadOnlyList<string>>(bridges);
         }
 
-        return Array.Empty<string>();
-    }
-
-    private async Task<IReadOnlyList<string>> GetWebTunnelBridgeLinesAsync(CancellationToken token)
-    {
-        await _webTunnelLock.WaitAsync(token);
-        try
-        {
-            if (_webTunnelCache != null &&
-                DateTime.UtcNow - _webTunnelCacheUtc < TimeSpan.FromHours(8))
-            {
-                return _webTunnelCache;
-            }
-
-            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(12) };
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("OnionHop");
-
-            using var response = await client.GetAsync(BridgeDbWebTunnelUrl, token);
-            if (!response.IsSuccessStatusCode)
-            {
-                AppendLog($"Webtunnel bridge fetch failed: {(int)response.StatusCode} {response.ReasonPhrase}");
-                return Array.Empty<string>();
-            }
-
-            var html = await response.Content.ReadAsStringAsync(token);
-            var lines = ExtractBridgeLinesFromHtml(html, WebTunnelBridgeType);
-            if (lines.Count == 0)
-            {
-                AppendLog("Webtunnel bridge fetch returned no usable lines.");
-                return Array.Empty<string>();
-            }
-
-            _webTunnelCache = lines;
-            _webTunnelCacheUtc = DateTime.UtcNow;
-            return lines;
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            AppendLog($"Webtunnel bridge fetch failed: {ex.Message}");
-            return Array.Empty<string>();
-        }
-        finally
-        {
-            _webTunnelLock.Release();
-        }
+        return Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
     }
 
     private static List<string> ExtractBridgeLines(string? text)
@@ -2361,41 +2411,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return results;
     }
 
-    private static IReadOnlyList<string> ExtractBridgeLinesFromHtml(string html, string transport)
-    {
-        if (string.IsNullOrWhiteSpace(html))
-        {
-            return Array.Empty<string>();
-        }
-
-        var matches = Regex.Matches(html, $"{Regex.Escape(transport)}\\s+[^<\\r\\n]+", RegexOptions.IgnoreCase);
-        if (matches.Count == 0)
-        {
-            return Array.Empty<string>();
-        }
-
-        var lines = new List<string>(matches.Count);
-        foreach (Match match in matches)
-        {
-            var line = WebUtility.HtmlDecode(match.Value).Trim();
-            if (string.IsNullOrWhiteSpace(line))
-            {
-                continue;
-            }
-
-            if (line.StartsWith("Bridge ", StringComparison.OrdinalIgnoreCase))
-            {
-                line = line.Substring("Bridge ".Length).Trim();
-            }
-
-            lines.Add(line);
-        }
-
-        return lines
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-    }
-
     private IReadOnlyList<string> GetClientTransportPlugins(IReadOnlyList<string> bridgeLines, string torDir)
     {
         var ptPath = Path.Combine(torDir, "pluggable_transports");
@@ -2403,54 +2418,78 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             ? ptPath
             : ptPath + Path.DirectorySeparatorChar;
 
-        if (_ptConfig?.PluggableTransports != null && _ptConfig.PluggableTransports.Count > 0)
-        {
-            var transportMap = BuildTransportPluginMap(_ptConfig.PluggableTransports, ptPathWithSlash);
-            var needed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var line in bridgeLines)
-            {
-                var transport = ExtractBridgeTransport(line);
-                if (!string.IsNullOrWhiteSpace(transport))
-                {
-                    needed.Add(transport);
-                }
-            }
-
-            var pluginLines = new List<string>();
-            foreach (var transport in needed)
-            {
-                if (transportMap.TryGetValue(transport, out var plugin))
-                {
-                    pluginLines.Add(plugin);
-                }
-            }
-
-            if (pluginLines.Count > 0)
-            {
-                return pluginLines.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            }
-
-            return transportMap.Values.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        }
-
-        return BuildFallbackTransportPlugins(bridgeLines, ptPath);
-    }
-
-    private static IReadOnlyList<string> BuildFallbackTransportPlugins(IEnumerable<string> bridgeLines, string ptPath)
-    {
-        var transports = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var needed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var line in bridgeLines)
         {
             var transport = ExtractBridgeTransport(line);
             if (!string.IsNullOrWhiteSpace(transport))
             {
-                transports.Add(transport);
+                needed.Add(transport);
             }
         }
 
+        if (needed.Count == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        string? webTunnelPlugin = null;
+        if (needed.Contains(WebTunnelBridgeType))
+        {
+            if (!TryEnsureWebTunnelClient(ptPath, out webTunnelPlugin))
+            {
+                return Array.Empty<string>();
+            }
+        }
+
+        if (_ptConfig?.PluggableTransports != null && _ptConfig.PluggableTransports.Count > 0)
+        {
+            var transportMap = BuildTransportPluginMap(_ptConfig.PluggableTransports, ptPathWithSlash);
+            var pluginLines = new List<string>();
+            foreach (var transport in needed)
+            {
+                if (string.Equals(transport, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase))
+                {
+                    pluginLines.Add(webTunnelPlugin!);
+                    continue;
+                }
+
+                if (transportMap.TryGetValue(transport, out var plugin))
+                {
+                    pluginLines.Add(ReplaceTransportSegment(plugin, transport));
+                    continue;
+                }
+
+                if (string.Equals(transport, "conjure", StringComparison.OrdinalIgnoreCase))
+                {
+                    pluginLines.Add($"ClientTransportPlugin conjure exec {Path.Combine(ptPath, "conjure-client.exe")} -registerURL https://registration.refraction.network/api");
+                }
+                else
+                {
+                    pluginLines.Add($"ClientTransportPlugin {transport} exec {Path.Combine(ptPath, "lyrebird.exe")}");
+                }
+            }
+
+            return pluginLines.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        return BuildFallbackTransportPlugins(needed, ptPath, webTunnelPlugin);
+    }
+
+    private static IReadOnlyList<string> BuildFallbackTransportPlugins(IReadOnlyCollection<string> transports, string ptPath, string? webTunnelPlugin)
+    {
         var plugins = new List<string>();
         foreach (var transport in transports)
         {
+            if (string.Equals(transport, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrWhiteSpace(webTunnelPlugin))
+                {
+                    plugins.Add(webTunnelPlugin);
+                }
+                continue;
+            }
+
             if (string.Equals(transport, "conjure", StringComparison.OrdinalIgnoreCase))
             {
                 plugins.Add($"ClientTransportPlugin conjure exec {Path.Combine(ptPath, "conjure-client.exe")} -registerURL https://registration.refraction.network/api");
@@ -2479,7 +2518,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             var transports = transportSegment.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
             foreach (var transport in transports)
             {
-                map[transport] = resolved;
+                var normalized = ReplaceTransportSegment(resolved, transport);
+                map[transport] = normalized;
             }
         }
 
@@ -2505,6 +2545,42 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return pluginLine.Substring(startIndex, execIndex - startIndex).Trim();
     }
 
+    private static string ReplaceTransportSegment(string pluginLine, string transport)
+    {
+        const string prefix = "ClientTransportPlugin ";
+        var startIndex = pluginLine.IndexOf(prefix, StringComparison.OrdinalIgnoreCase);
+        if (startIndex < 0)
+        {
+            return pluginLine;
+        }
+
+        startIndex += prefix.Length;
+        var execIndex = pluginLine.IndexOf(" exec ", startIndex, StringComparison.OrdinalIgnoreCase);
+        if (execIndex < 0)
+        {
+            return pluginLine;
+        }
+
+        return $"{pluginLine.Substring(0, startIndex)}{transport}{pluginLine.Substring(execIndex)}";
+    }
+
+    private static string NormalizeClientTransportPlugin(string pluginLine)
+    {
+        if (string.IsNullOrWhiteSpace(pluginLine))
+        {
+            return string.Empty;
+        }
+
+        const string prefix = "ClientTransportPlugin ";
+        var trimmed = pluginLine.Trim();
+        if (trimmed.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return trimmed.Substring(prefix.Length).Trim();
+        }
+
+        return trimmed;
+    }
+
     private static string? ExtractBridgeTransport(string bridgeLine)
     {
         if (string.IsNullOrWhiteSpace(bridgeLine))
@@ -2514,6 +2590,71 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         var parts = bridgeLine.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
         return parts.Length > 0 ? parts[0] : null;
+    }
+
+    private static bool IsPlaceholderBridgeLine(string bridgeLine)
+    {
+        if (string.IsNullOrWhiteSpace(bridgeLine))
+        {
+            return true;
+        }
+
+        return bridgeLine.Contains("2001:db8", StringComparison.OrdinalIgnoreCase)
+            || bridgeLine.Contains("192.0.2.", StringComparison.OrdinalIgnoreCase)
+            || bridgeLine.Contains("198.51.100.", StringComparison.OrdinalIgnoreCase)
+            || bridgeLine.Contains("203.0.113.", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool TryEnsureWebTunnelClient(string ptPath, out string? pluginLine)
+    {
+        var targetPath = Path.Combine(ptPath, WebTunnelClientFileName);
+        if (!File.Exists(targetPath))
+        {
+            var sourcePath = FindWebTunnelClientInTorBrowser();
+            if (!string.IsNullOrWhiteSpace(sourcePath))
+            {
+                try
+                {
+                    Directory.CreateDirectory(ptPath);
+                    File.Copy(sourcePath, targetPath, true);
+                    AppendLog($"Copied {WebTunnelClientFileName} from Tor Browser.");
+                }
+                catch (Exception ex)
+                {
+                    AppendLog($"Failed to copy {WebTunnelClientFileName}: {ex.Message}");
+                }
+            }
+        }
+
+        if (File.Exists(targetPath))
+        {
+            pluginLine = $"ClientTransportPlugin {WebTunnelBridgeType} exec {targetPath}";
+            return true;
+        }
+
+        pluginLine = null;
+        _bridgeValidationMessage = $"Webtunnel client is missing ({WebTunnelClientFileName}). Install Tor Browser and copy it into tor\\pluggable_transports, or rerun download-deps.ps1.";
+        return false;
+    }
+
+    private static string? FindWebTunnelClientInTorBrowser()
+    {
+        var candidates = new[]
+        {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Tor Browser", "Browser", "TorBrowser", "Tor", "PluggableTransports", WebTunnelClientFileName),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Tor Browser", "Browser", "TorBrowser", "Tor", "PluggableTransports", WebTunnelClientFileName),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Tor Browser", "Browser", "TorBrowser", "Tor", "PluggableTransports", WebTunnelClientFileName)
+        };
+
+        foreach (var candidate in candidates)
+        {
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
     }
 
     private async Task StartTorAsync(string torPath, string location, CancellationToken token)
@@ -2546,22 +2687,35 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             var bridgeLines = await GetBridgeLinesAsync(token);
             if (bridgeLines.Count == 0)
             {
-                var message = string.Equals(SelectedBridgeType, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase)
-                    ? "Webtunnel bridges could not be fetched. Paste custom bridges or try again."
-                    : "Bridges enabled but no bridge lines are configured.";
+                var message = _bridgeValidationMessage;
+                if (string.IsNullOrWhiteSpace(message))
+                {
+                    message = string.Equals(SelectedBridgeType, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase)
+                        ? "Webtunnel bridges must be pasted from BridgeDB (bridges.torproject.org or bridges@torproject.org)."
+                        : "Bridges enabled but no bridge lines are configured.";
+                }
                 throw new InvalidOperationException(message);
             }
 
             var pluginLines = GetClientTransportPlugins(bridgeLines, torDir);
             if (pluginLines.Count == 0)
             {
-                throw new InvalidOperationException("Bridges enabled but no transport plugins were found.");
+                var message = _bridgeValidationMessage;
+                if (string.IsNullOrWhiteSpace(message))
+                {
+                    message = "Bridges enabled but no transport plugins were found.";
+                }
+                throw new InvalidOperationException(message);
             }
 
             argsBuilder.Append("--UseBridges 1 ");
             foreach (var pluginLine in pluginLines)
             {
-                argsBuilder.Append($"--ClientTransportPlugin \"{pluginLine}\" ");
+                var normalized = NormalizeClientTransportPlugin(pluginLine);
+                if (!string.IsNullOrWhiteSpace(normalized))
+                {
+                    argsBuilder.Append($"--ClientTransportPlugin \"{normalized}\" ");
+                }
             }
 
             foreach (var bridgeLine in bridgeLines)
