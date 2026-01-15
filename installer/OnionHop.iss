@@ -33,6 +33,9 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64
 PrivilegesRequired=lowest
+AppMutex=OnionHop.SingleInstance
+CloseApplications=yes
+RestartApplications=yes
 UninstallDisplayIcon={app}\\OnionHop.exe
 
 [Languages]
@@ -42,7 +45,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Files]
-Source: "{#PubDir}\\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PubDir}\\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs restartreplace
 
 [Icons]
 Name: "{group}\\{#MyAppName}"; Filename: "{app}\\OnionHop.exe"

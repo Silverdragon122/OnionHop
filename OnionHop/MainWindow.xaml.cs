@@ -1,20 +1,20 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Formats.Tar;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
-using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Principal;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -59,12 +59,19 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private const string AutoStartModeOn = "On";
     private const string AutoStartModeMinimized = "On (Minimized)";
     private const string AutomaticLocationLabel = "Automatic";
+    private const string ConnectionModeProxy = "Proxy Mode (Recommended)";
+    private const string ConnectionModeTun = "TUN/VPN Mode (Admin)";
     private const string CensoredBridgePrimary = "snowflake";
     private const string CensoredBridgeFallback = "meek-azure";
     private const string WebTunnelBridgeType = "webtunnel";
-    private const string ControlPortFileName = "control_port.txt";
-    private const string ControlAuthCookieFileName = "control_auth_cookie";
     private const string WebTunnelClientFileName = "webtunnel-client.exe";
+    private const string TorFallbackVersion = "14.0.4";
+    private const string TorBaseUrl = "https://dist.torproject.org/torbrowser";
+    private const string TorArchiveBaseUrl = "https://archive.torproject.org/tor-package-archive/torbrowser";
+    private const string SingBoxApiUrl = "https://api.github.com/repos/SagerNet/sing-box/releases/latest";
+    private const string WintunUrl = "https://www.wintun.net/builds/wintun-0.14.1.zip";
+    private const string WebTunnelBridgeSourceUrl = "https://bridges.torproject.org/bridges?transport=webtunnel&format=plain";
+    private static readonly TimeSpan TorExitCooldown = TimeSpan.FromSeconds(5);
 
     private bool _isConnecting;
     private bool _isConnected;
@@ -74,26 +81,34 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private string _currentIp = "--.--.--.--";
     private Brush _statusBrush = new SolidColorBrush(Color.FromRgb(209, 67, 75));
     private double _connectionProgress;
+    private bool _dependencyDownloadInProgress;
+    private double _dependencyDownloadProgress;
+    private string _dependencyDownloadStatus = "Checking components...";
+    private Task<bool>? _dependencyEnsureTask;
 
-    private Process? _torProcess;
-    private Process? _singBoxProcess;
+    private readonly TorService _torService;
+    private readonly VpnService _vpnService;
+    private JobObject? _processJob;
     private CancellationTokenSource? _connectCts;
     private TaskCompletionSource<bool>? _bootstrapSource;
     private PluggableTransportConfig? _ptConfig;
-    private string? _torDataDirectory;
-    private int? _torControlPort;
     private DateTime _lastNewnymUtc = DateTime.MinValue;
+    private DateTime _lastTorExitUtc = DateTime.MinValue;
     private readonly DateTime _appStartUtc = DateTime.UtcNow;
     private DateTime? _lastConnectAttemptUtc;
     private bool _autoRetryConnectUsed;
     private bool _pendingAutoRetry;
     private string? _bridgeValidationMessage;
+    private bool _webTunnelBridgeFetchStarted;
+    private string _aboutVersionText = "Version: -";
+    private string _aboutReleaseDateText = "Release date: -";
 
     private DateTime _lastVpnMessageUtc = DateTime.MinValue;
     private readonly object _singBoxLogLock = new();
     private readonly Queue<string> _singBoxRecentLines = new();
 
-    public ObservableCollection<string> LogLines { get; } = new();
+    private readonly MainViewModel _viewModel = new();
+    public ObservableCollection<string> LogLines => _viewModel.LogLines;
 
     private readonly object _logLock = new();
     private bool _showLogs;
@@ -114,6 +129,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private System.Drawing.Icon? _trayIconImage;
     private WindowChrome? _customChrome;
     private bool _startHiddenToTray;
+    private readonly SettingsService _settingsService = new();
+    private readonly UpdateService _updateService = new();
+    private readonly AdminHelperClient _adminHelper = new();
+    private CancellationTokenSource? _adminVpnMonitorCts;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -132,8 +151,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     public ObservableCollection<string> ConnectionModes { get; } = new()
     {
-        "Proxy Mode (Recommended)",
-        "TUN/VPN Mode (Admin)"
+        ConnectionModeProxy,
+        ConnectionModeTun
     };
 
     public ObservableCollection<string> AutoStartModes { get; } = new()
@@ -148,7 +167,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public string SelectedLocation
     {
         get => _selectedLocation;
-        set => SetField(ref _selectedLocation, value);
+        set
+        {
+            if (SetField(ref _selectedLocation, value))
+            {
+                _viewModel.SelectedLocation = value;
+            }
+        }
     }
 
     private void OnTorExited(object? sender, EventArgs e)
@@ -157,6 +182,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             return;
         }
+
+        var now = DateTime.UtcNow;
+        if (now - _lastTorExitUtc < TorExitCooldown)
+        {
+            return;
+        }
+        _lastTorExitUtc = now;
 
         if (_isConnected && IsTunMode && KillSwitchEnabled && !UseHybridRouting)
         {
@@ -179,15 +211,15 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             }
         }
     }
-    private string _selectedConnectionMode = "Proxy Mode (Recommended)";
+    private string _selectedConnectionMode = ConnectionModeProxy;
 
-    public bool IsTunMode => string.Equals(SelectedConnectionMode, "TUN/VPN Mode (Admin)", StringComparison.Ordinal);
+    public bool IsTunMode => string.Equals(SelectedConnectionMode, ConnectionModeTun, StringComparison.Ordinal);
     public bool IsProxyMode => !IsTunMode;
 
     public bool SystemWideMode
     {
         get => IsTunMode;
-        set => SelectedConnectionMode = value ? "TUN/VPN Mode (Admin)" : "Proxy Mode (Recommended)";
+        set => SelectedConnectionMode = value ? ConnectionModeTun : ConnectionModeProxy;
     }
 
     public bool UseHybridRouting
@@ -264,17 +296,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     return;
                 }
 
-                if (_isConnected && !IsAdministrator())
-                {
-                    StatusMessage = "Kill switch requires Administrator. Disconnect and reconnect in TUN mode.";
-                    SetField(ref _killSwitchEnabled, false);
-                    return;
-                }
             }
 
             if (SetField(ref _killSwitchEnabled, value) && !_killSwitchEnabled)
             {
-                _ = Task.Run(() => DisableKillSwitchEmergencyBlock());
+                if (!_loadingSettings)
+                {
+                    _ = Task.Run(() => DisableKillSwitchEmergencyBlock(allowElevation: IsTunMode));
+                }
             }
         }
     }
@@ -408,6 +437,18 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     public bool IsOverlayVisible => ShowLogs || ShowAbout || ShowSettings;
 
+    public string AboutVersionText
+    {
+        get => _aboutVersionText;
+        private set => SetField(ref _aboutVersionText, value);
+    }
+
+    public string AboutReleaseDateText
+    {
+        get => _aboutReleaseDateText;
+        private set => SetField(ref _aboutReleaseDateText, value);
+    }
+
     public string AboutText =>
         "=== Modes ===\n" +
         "\n" +
@@ -416,10 +457,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "- Sets Windows proxy to use Tor for apps that respect proxy settings\n" +
         "- Does NOT require Administrator\n" +
         "- Most stable, best for everyday browsing\n" +
+        "- NOTE: DNS queries may leak! Apps can make direct DNS requests bypassing Tor.\n" +
+        "  For maximum privacy, use TUN/VPN Mode or enable Censored Network Mode.\n" +
         "\n" +
         "TUN/VPN Mode (Admin)\n" +
         "- Starts Tor + sing-box + Wintun (virtual adapter)\n" +
         "- Can force routing rules at the OS level\n" +
+        "- DNS queries are routed through Tor (no DNS leaks)\n" +
         "- REQUIRES Administrator\n" +
         "\n" +
         "Hybrid (browser via Tor)\n" +
@@ -434,18 +478,15 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "=== Tor Bridges ===\n" +
         "\n" +
         "- Use pluggable transports like obfs4, snowflake, meek-azure, or webtunnel when Tor is blocked.\n" +
-        "- Webtunnel needs webtunnel-client.exe (bundled with Tor Browser).\n" +
-        "- Webtunnel works best with real BridgeDB lines (example/test-net lines may not work).\n" +
-        "- If the website only shows example lines, use the email method below.\n" +
+        "- Webtunnel needs webtunnel-client.exe.\n" +
+        "- OnionHop can refresh built-in webtunnel bridges automatically, or you can paste your own.\n" +
         "- Enable in Settings and reconnect to apply.\n" +
         "\n" +
-        "Webtunnel tutorial (BridgeDB)\n" +
-        "1) Visit https://bridges.torproject.org/\n" +
-        "2) Request bridges and choose transport: webtunnel.\n" +
-        "3) If you only see example/test-net lines (2001:db8/192.0.2/etc), email bridges@torproject.org with body \"get transport webtunnel\".\n" +
-        "4) Copy the real webtunnel bridge lines you receive.\n" +
-        "5) Paste them into Settings -> Tor Bridges -> Custom bridges.\n" +
-        "6) Reconnect.\n" +
+        "Webtunnel bridges\n" +
+        "1) Choose transport: webtunnel.\n" +
+        "2) OnionHop will refresh built-in bridges when available.\n" +
+        "3) Paste custom lines from https://bridges.torproject.org/ if needed.\n" +
+        "4) Reconnect.\n" +
         "\n" +
         "=== Actions ===\n" +
         "\n" +
@@ -467,7 +508,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "Auto Update\n" +
         "- Checks GitHub releases and offers updates.\n" +
         "\n" +
-        "=== Safety ===\n" +
+        "=== Safety & Privacy ===\n" +
+        "\n" +
+        "DNS Leak Warning (Proxy Mode)\n" +
+        "- In Proxy Mode, DNS requests may bypass Tor and leak to your ISP.\n" +
+        "- For best privacy: use TUN/VPN Mode or enable Censored Network Mode for DNS-over-HTTPS.\n" +
+        "- You can test for leaks at: dnsleaktest.com or browserleaks.com\n" +
         "\n" +
         "Windows Defender\n" +
         "- Releases are not code-signed. Defender/SmartScreen may warn; verify the SHA-256 from the release notes.\n" +
@@ -510,6 +556,24 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         set => SetField(ref _connectionProgress, value);
     }
 
+    public bool IsDependencyDownloadInProgress
+    {
+        get => _dependencyDownloadInProgress;
+        private set => SetField(ref _dependencyDownloadInProgress, value);
+    }
+
+    public double DependencyDownloadProgress
+    {
+        get => _dependencyDownloadProgress;
+        private set => SetField(ref _dependencyDownloadProgress, value);
+    }
+
+    public string DependencyDownloadStatus
+    {
+        get => _dependencyDownloadStatus;
+        private set => SetField(ref _dependencyDownloadStatus, value);
+    }
+
     public string ConnectButtonText
         => _isConnected ? "Disconnect"
             : _isDisconnecting ? "Disconnecting..."
@@ -521,15 +585,42 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     public MainWindow()
     {
-        InitializeComponent();
+        StartupLogger.Write("MainWindow ctor start.");
+        try
+        {
+            InitializeComponent();
+        }
+        catch (Exception ex)
+        {
+            StartupLogger.Write("MainWindow InitializeComponent failed.", ex);
+            throw;
+        }
+        StartupLogger.Write("MainWindow InitializeComponent done.");
         _customChrome = WindowChrome.GetWindowChrome(this);
         DataContext = this;
+
+        _torService = new TorService(AppendLog);
+        _torService.OutputReceived += OnTorDataReceived;
+        _torService.Exited += OnTorExited;
+        _vpnService = new VpnService(AppendLog);
+        _vpnService.OutputReceived += OnSingBoxDataReceived;
+        _vpnService.Exited += OnSingBoxExited;
+
+        try
+        {
+            _processJob = new JobObject();
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Process job setup failed: {ex.Message}");
+        }
 
         LoadBridgeConfig();
         LoadUserSettings();
         ApplyStartupArguments(Environment.GetCommandLineArgs());
         PrepareStartupVisibility();
         ApplyTheme(IsDarkMode);
+        UpdateAboutMetadata();
         UpdateConnectVisualState();
         UpdateMaximizeGlyph();
 
@@ -538,11 +629,48 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         if (IsKillSwitchEmergencyBlockActive() && !IsAdministrator())
         {
-            StatusMessage = "Kill switch is active and blocking traffic. Restart OnionHop as Administrator and disconnect to restore.";
+            StatusMessage = "Kill switch is active and blocking traffic. Restart OnionHop as Administrator and disconnect to restore (or reboot to clear).";
         }
-        else
+        else if (IsAdministrator())
         {
             _ = Task.Run(() => DisableKillSwitchEmergencyBlock());
+        }
+
+        StartupLogger.Write("MainWindow ctor complete.");
+    }
+
+    private void UpdateAboutMetadata()
+    {
+        var version = GetCurrentVersion();
+        AboutVersionText = $"Version: v{version}";
+
+        var buildDate = GetBuildDate();
+        AboutReleaseDateText = buildDate.HasValue
+            ? $"Release date: {buildDate.Value:yyyy-MM-dd}"
+            : "Release date: Unknown";
+    }
+
+    private static DateTime? GetBuildDate()
+    {
+        var entry = Assembly.GetEntryAssembly();
+        if (entry == null)
+        {
+            return null;
+        }
+
+        var location = entry.Location;
+        if (string.IsNullOrWhiteSpace(location) || !File.Exists(location))
+        {
+            return null;
+        }
+
+        try
+        {
+            return File.GetLastWriteTime(location);
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -551,38 +679,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _isExiting = true;
     }
 
-    private sealed class UserSettings
-    {
-        public bool AutoConnect { get; set; }
-        public string? AutoStartMode { get; set; }
-        public bool StartWithWindows { get; set; }
-        public bool StartMinimized { get; set; }
-        public bool MinimizeToTray { get; set; }
-        public bool AutoUpdate { get; set; }
-        public bool KillSwitchEnabled { get; set; }
-        public bool IsDarkMode { get; set; }
-        public bool UseNativeTheme { get; set; }
-        public string? SelectedLocation { get; set; }
-        public string? SelectedConnectionMode { get; set; }
-        public bool UseHybridRouting { get; set; }
-        public bool UseTorBridges { get; set; }
-        public bool UseCensoredMode { get; set; }
-        public string? SelectedBridgeType { get; set; }
-        public string? CustomBridges { get; set; }
-    }
-
     private sealed class PluggableTransportConfig
     {
         public string? RecommendedDefault { get; set; }
         public Dictionary<string, string> PluggableTransports { get; set; } = new();
         public Dictionary<string, List<string>> Bridges { get; set; } = new();
-    }
-
-    private static string GetSettingsPath()
-    {
-        var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "OnionHop");
-        Directory.CreateDirectory(dir);
-        return Path.Combine(dir, "settings.json");
     }
 
     private void LoadBridgeConfig()
@@ -644,20 +745,176 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             Raise(nameof(SelectedBridgeType));
             _loadingSettings = wasLoading;
         }
+
+        if (!_webTunnelBridgeFetchStarted && !HasUsableWebTunnelBridges())
+        {
+            _webTunnelBridgeFetchStarted = true;
+            _ = Task.Run(() => TryRefreshWebTunnelBridgesAsync());
+        }
+    }
+
+    private bool HasUsableWebTunnelBridges()
+    {
+        if (_ptConfig?.Bridges == null)
+        {
+            return false;
+        }
+
+        if (!_ptConfig.Bridges.TryGetValue(WebTunnelBridgeType, out var bridges))
+        {
+            return false;
+        }
+
+        return bridges.Any(line => !IsPlaceholderBridgeLine(line));
+    }
+
+    private async Task TryRefreshWebTunnelBridgesAsync()
+    {
+        try
+        {
+            var client = GetDependencyHttpClient();
+            var bridges = await FetchWebTunnelBridgeLinesAsync(client, CancellationToken.None).ConfigureAwait(false);
+            if (bridges.Count == 0)
+            {
+                AppendLog("No webtunnel bridges fetched (BridgeDB requires CAPTCHA). Get bridges manually from bridges.torproject.org.");
+                _webTunnelBridgeFetchStarted = false;
+                return;
+            }
+
+            var configPath = Path.Combine(AppContext.BaseDirectory, DefaultPtConfigRelativePath);
+            if (!File.Exists(configPath))
+            {
+                AppendLog("Bridge config not found for webtunnel refresh.");
+                _webTunnelBridgeFetchStarted = false;
+                return;
+            }
+
+            var json = File.ReadAllText(configPath);
+            var config = JsonSerializer.Deserialize<PluggableTransportConfig>(json, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            });
+            if (config == null)
+            {
+                _webTunnelBridgeFetchStarted = false;
+                return;
+            }
+
+            config.Bridges ??= new Dictionary<string, List<string>>();
+            if (config.Bridges.TryGetValue(WebTunnelBridgeType, out var existing)
+                && existing.Any(line => !IsPlaceholderBridgeLine(line)))
+            {
+                return;
+            }
+
+            config.Bridges[WebTunnelBridgeType] = bridges.ToList();
+            var updatedJson = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(configPath, updatedJson);
+
+            Dispatcher.Invoke(() =>
+            {
+                _ptConfig = config;
+            });
+
+            AppendLog($"Loaded {bridges.Count} webtunnel bridges.");
+        }
+        catch (Exception ex)
+        {
+            _webTunnelBridgeFetchStarted = false;
+            AppendLog($"Webtunnel bridge refresh failed: {ex.Message}");
+        }
+    }
+
+    private async Task<IReadOnlyList<string>> FetchWebTunnelBridgeLinesAsync(HttpClient client, CancellationToken token)
+    {
+        try
+        {
+            using var response = await client.GetAsync(WebTunnelBridgeSourceUrl, token).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                AppendLog($"Webtunnel bridge fetch failed: HTTP {(int)response.StatusCode}.");
+                return Array.Empty<string>();
+            }
+
+            var content = await response.Content.ReadAsStringAsync(token).ConfigureAwait(false);
+            var extracted = ExtractWebTunnelBridgeLines(content);
+            AppendLog($"Webtunnel fetch: extracted {extracted.Count} bridge(s) from response.");
+            
+            var lines = extracted.Where(line => !IsPlaceholderBridgeLine(line)).ToList();
+            if (lines.Count < extracted.Count)
+            {
+                AppendLog($"Webtunnel fetch: {extracted.Count - lines.Count} bridge(s) filtered as placeholders.");
+            }
+
+            return lines;
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Webtunnel bridge fetch error: {ex.Message}");
+            return Array.Empty<string>();
+        }
+    }
+
+    private static List<string> ExtractWebTunnelBridgeLines(string content)
+    {
+        var results = new List<string>();
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            return results;
+        }
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        
+        // Match webtunnel bridges - they may span multiple lines in HTML
+        // Pattern: webtunnel [IP]:port FINGERPRINT url=... ver=...
+        var matches = Regex.Matches(content, @"webtunnel\s+\[[^\]]+\]:\d+\s+[A-F0-9]+\s+url=[^\s<]+(?:\s+ver=[^\s<]+)?", 
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        
+        foreach (Match match in matches)
+        {
+            var line = WebUtility.HtmlDecode(match.Value).Trim();
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            // Normalize whitespace
+            line = Regex.Replace(line, @"\s+", " ").Trim();
+            if (seen.Add(line))
+            {
+                results.Add(line);
+            }
+        }
+
+        if (results.Count > 0)
+        {
+            return results;
+        }
+
+        // Fallback: try line-by-line parsing for plain text responses
+        foreach (var raw in content.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            var line = raw.Trim();
+            if (!line.StartsWith("webtunnel ", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            line = Regex.Replace(line, @"\s+", " ").Trim();
+            if (seen.Add(line))
+            {
+                results.Add(line);
+            }
+        }
+
+        return results;
     }
 
     private void LoadUserSettings()
     {
         try
         {
-            var path = GetSettingsPath();
-            if (!File.Exists(path))
-            {
-                return;
-            }
-
-            var json = File.ReadAllText(path);
-            var settings = JsonSerializer.Deserialize<UserSettings>(json);
+            var settings = _settingsService.Load();
             if (settings == null)
             {
                 return;
@@ -776,8 +1033,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             CustomBridges = CustomBridges
         };
 
-        var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(GetSettingsPath(), json);
+        _settingsService.Save(settings);
     }
 
     private void UpdateStartupRegistration()
@@ -1279,6 +1535,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             _trayIcon.Visible = false;
         }
+        if (Application.Current != null)
+        {
+            Application.Current.Shutdown();
+            return;
+        }
+
         Close();
     }
 
@@ -1302,7 +1564,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             _startHiddenToTray = false;
         }
 
-        if (AutoConnect)
+        var dependenciesReady = await EnsureDependenciesAsync();
+        if (dependenciesReady && AutoConnect)
         {
             await ConnectAsync();
         }
@@ -1310,6 +1573,378 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         if (AutoUpdate)
         {
             _ = CheckForUpdatesAsync();
+        }
+    }
+
+    private Task<bool> EnsureDependenciesAsync()
+    {
+        return _dependencyEnsureTask ??= EnsureDependenciesCoreAsync();
+    }
+
+    private async Task<bool> EnsureDependenciesCoreAsync()
+    {
+        var torPath = Path.Combine(AppContext.BaseDirectory, DefaultTorRelativePath);
+        var torGenCertPath = Path.Combine(AppContext.BaseDirectory, "tor\\tor-gencert.exe");
+        var geoipPath = Path.Combine(AppContext.BaseDirectory, "tor\\geoip");
+        var geoip6Path = Path.Combine(AppContext.BaseDirectory, "tor\\geoip6");
+        var ptDir = Path.Combine(AppContext.BaseDirectory, "tor\\pluggable_transports");
+        var singBoxPath = Path.Combine(AppContext.BaseDirectory, DefaultSingBoxRelativePath);
+        var wintunPath = Path.Combine(AppContext.BaseDirectory, DefaultWintunRelativePath);
+
+        var needsTor = !File.Exists(torPath)
+                       || !File.Exists(torGenCertPath)
+                       || !File.Exists(geoipPath)
+                       || !File.Exists(geoip6Path)
+                       || !Directory.Exists(ptDir);
+        var needsSingBox = !File.Exists(singBoxPath);
+        var needsWintun = !File.Exists(wintunPath);
+
+        if (!needsTor && !needsSingBox && !needsWintun)
+        {
+            return true;
+        }
+
+        IsDependencyDownloadInProgress = true;
+        DependencyDownloadStatus = "Preparing downloads...";
+        DependencyDownloadProgress = 0;
+        StatusMessage = "Downloading components...";
+
+        var succeeded = false;
+        var tempRoot = Path.Combine(Path.GetTempPath(), "OnionHop", "deps");
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            Directory.CreateDirectory(Path.GetDirectoryName(torPath) ?? AppContext.BaseDirectory);
+            Directory.CreateDirectory(Path.GetDirectoryName(singBoxPath) ?? AppContext.BaseDirectory);
+            Directory.CreateDirectory(ptDir);
+
+            var client = GetDependencyHttpClient();
+            var steps = new List<(string Label, Func<Task> Action)>();
+            if (needsTor)
+            {
+                steps.Add(("Downloading Tor...", () => DownloadTorAsync(client, tempRoot, torPath, ptDir)));
+            }
+            if (needsSingBox)
+            {
+                steps.Add(("Downloading sing-box...", () => DownloadSingBoxAsync(client, tempRoot, singBoxPath)));
+            }
+            if (needsWintun)
+            {
+                steps.Add(("Downloading Wintun...", () => DownloadWintunAsync(client, tempRoot, wintunPath)));
+            }
+
+            for (var i = 0; i < steps.Count; i++)
+            {
+                DependencyDownloadStatus = steps[i].Label;
+                DependencyDownloadProgress = i / (double)steps.Count;
+                await steps[i].Action();
+                DependencyDownloadProgress = (i + 1) / (double)steps.Count;
+            }
+
+            EnsurePluggableTransportConfig(Path.Combine(ptDir, "pt_config.json"));
+            _webTunnelBridgeFetchStarted = false;
+            LoadBridgeConfig();
+
+            StatusMessage = "Components ready.";
+            succeeded = true;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Dependency download failed: {ex.Message}");
+            StatusMessage = $"Dependency download failed: {ex.Message}";
+            return false;
+        }
+        finally
+        {
+            IsDependencyDownloadInProgress = false;
+            if (!succeeded)
+            {
+                _dependencyEnsureTask = null;
+            }
+            try
+            {
+                if (Directory.Exists(tempRoot))
+                {
+                    Directory.Delete(tempRoot, true);
+                }
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private static HttpClient GetDependencyHttpClient()
+    {
+        return HttpClientFactory.LongTimeout;
+    }
+
+    private async Task DownloadTorAsync(HttpClient client, string tempRoot, string torPath, string ptDir)
+    {
+        var version = await GetLatestTorVersionAsync(client);
+        var fileName = $"tor-expert-bundle-windows-x86_64-{version}.tar.gz";
+        var primaryUrl = $"{TorBaseUrl}/{version}/{fileName}";
+        var archiveUrl = $"{TorArchiveBaseUrl}/{version}/{fileName}";
+        var torArchivePath = Path.Combine(tempRoot, "tor.tar.gz");
+
+        await DownloadWithFallbackAsync(client, new[] { primaryUrl, archiveUrl }, torArchivePath);
+
+        await Task.Run(() =>
+        {
+            var extractRoot = Path.Combine(tempRoot, "tor_extract");
+            if (Directory.Exists(extractRoot))
+            {
+                Directory.Delete(extractRoot, true);
+            }
+            Directory.CreateDirectory(extractRoot);
+            ExtractTarGz(torArchivePath, extractRoot);
+
+            var extractedTorRoot = Path.Combine(extractRoot, "tor");
+            if (!Directory.Exists(extractedTorRoot))
+            {
+                throw new InvalidOperationException("Tor extraction failed or unexpected structure.");
+            }
+
+            var torDir = Path.GetDirectoryName(torPath) ?? AppContext.BaseDirectory;
+            var torGenCertPath = Path.Combine(torDir, "tor-gencert.exe");
+            var geoipPath = Path.Combine(torDir, "geoip");
+            var geoip6Path = Path.Combine(torDir, "geoip6");
+
+            File.Copy(Path.Combine(extractedTorRoot, "tor.exe"), torPath, true);
+            File.Copy(Path.Combine(extractedTorRoot, "tor-gencert.exe"), torGenCertPath, true);
+
+            var dataRoot = Path.Combine(extractRoot, "data");
+            var geoipSource = Path.Combine(dataRoot, "geoip");
+            var geoip6Source = Path.Combine(dataRoot, "geoip6");
+            if (File.Exists(geoipSource))
+            {
+                File.Copy(geoipSource, geoipPath, true);
+            }
+            if (File.Exists(geoip6Source))
+            {
+                File.Copy(geoip6Source, geoip6Path, true);
+            }
+
+            var extractedPtDir = Path.Combine(extractedTorRoot, "pluggable_transports");
+            if (Directory.Exists(extractedPtDir))
+            {
+                CopyDirectory(extractedPtDir, ptDir, overwrite: true, preserveFileName: "pt_config.json");
+            }
+
+            var obfs4proxy = Path.Combine(ptDir, "obfs4proxy.exe");
+            var lyrebird = Path.Combine(ptDir, "lyrebird.exe");
+            if (!File.Exists(lyrebird) && File.Exists(obfs4proxy))
+            {
+                File.Move(obfs4proxy, lyrebird);
+            }
+        });
+    }
+
+    private static async Task DownloadSingBoxAsync(HttpClient client, string tempRoot, string singBoxPath)
+    {
+        using var response = await client.GetAsync(SingBoxApiUrl);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException("Failed to query sing-box releases.");
+        }
+
+        var json = await response.Content.ReadAsStringAsync();
+        var release = JsonSerializer.Deserialize<GitHubRelease>(json);
+        var asset = release?.Assets?.FirstOrDefault(a => a.Name != null
+                                                        && a.Name.Contains("windows-amd64.zip", StringComparison.OrdinalIgnoreCase));
+        if (string.IsNullOrWhiteSpace(asset?.BrowserDownloadUrl))
+        {
+            throw new InvalidOperationException("No sing-box windows-amd64 asset found.");
+        }
+
+        var zipPath = Path.Combine(tempRoot, "sing-box.zip");
+        await DownloadToFileAsync(client, asset.BrowserDownloadUrl, zipPath);
+
+        await Task.Run(() =>
+        {
+            var extractDir = Path.Combine(tempRoot, "sing-box");
+            if (Directory.Exists(extractDir))
+            {
+                Directory.Delete(extractDir, true);
+            }
+            ZipFile.ExtractToDirectory(zipPath, extractDir, true);
+
+            var exePath = Directory.GetFiles(extractDir, "sing-box.exe", SearchOption.AllDirectories).FirstOrDefault();
+            if (exePath == null)
+            {
+                throw new FileNotFoundException("sing-box.exe not found in archive.");
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(singBoxPath) ?? AppContext.BaseDirectory);
+            File.Copy(exePath, singBoxPath, true);
+        });
+    }
+
+    private static async Task DownloadWintunAsync(HttpClient client, string tempRoot, string wintunPath)
+    {
+        var zipPath = Path.Combine(tempRoot, "wintun.zip");
+        await DownloadToFileAsync(client, WintunUrl, zipPath);
+
+        await Task.Run(() =>
+        {
+            var extractDir = Path.Combine(tempRoot, "wintun");
+            if (Directory.Exists(extractDir))
+            {
+                Directory.Delete(extractDir, true);
+            }
+            ZipFile.ExtractToDirectory(zipPath, extractDir, true);
+
+            var dllPath = Directory.GetFiles(extractDir, "wintun.dll", SearchOption.AllDirectories).FirstOrDefault();
+            if (dllPath == null)
+            {
+                throw new FileNotFoundException("wintun.dll not found in archive.");
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(wintunPath) ?? AppContext.BaseDirectory);
+            File.Copy(dllPath, wintunPath, true);
+        });
+    }
+
+    private static async Task DownloadToFileAsync(HttpClient client, string url, string targetPath)
+    {
+        using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+        response.EnsureSuccessStatusCode();
+
+        await using var stream = await response.Content.ReadAsStreamAsync();
+        await using var file = new FileStream(targetPath, FileMode.Create, FileAccess.Write, FileShare.None);
+        await stream.CopyToAsync(file);
+    }
+
+    private static async Task DownloadWithFallbackAsync(HttpClient client, IEnumerable<string> urls, string targetPath)
+    {
+        Exception? lastError = null;
+        foreach (var url in urls)
+        {
+            try
+            {
+                await DownloadToFileAsync(client, url, targetPath);
+                return;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                if (File.Exists(targetPath))
+                {
+                    File.Delete(targetPath);
+                }
+            }
+        }
+
+        throw new InvalidOperationException($"Tor download failed: {lastError?.Message}");
+    }
+
+    private static async Task<string> GetLatestTorVersionAsync(HttpClient client)
+    {
+        try
+        {
+            var html = await client.GetStringAsync(TorBaseUrl);
+            var matches = Regex.Matches(html, "href=\"(?<ver>\\d+\\.\\d+(\\.\\d+)*)/\"");
+            var versions = new List<Version>();
+            foreach (Match match in matches)
+            {
+                if (Version.TryParse(match.Groups["ver"].Value, out var version))
+                {
+                    versions.Add(version);
+                }
+            }
+
+            if (versions.Count > 0)
+            {
+                return versions.OrderByDescending(v => v).First().ToString();
+            }
+        }
+        catch (Exception ex)
+        {
+            StartupLogger.Write($"Failed to fetch latest Tor version: {ex.Message}. Using fallback.");
+        }
+
+        return TorFallbackVersion;
+    }
+
+    private static void ExtractTarGz(string archivePath, string destination)
+    {
+        using var file = File.OpenRead(archivePath);
+        using var gzip = new GZipStream(file, CompressionMode.Decompress);
+        TarFile.ExtractToDirectory(gzip, destination, overwriteFiles: true);
+    }
+
+    private static void CopyDirectory(string sourceDir, string destinationDir, bool overwrite, string? preserveFileName = null)
+    {
+        Directory.CreateDirectory(destinationDir);
+        foreach (var dirPath in Directory.GetDirectories(sourceDir, "*", SearchOption.AllDirectories))
+        {
+            Directory.CreateDirectory(dirPath.Replace(sourceDir, destinationDir, StringComparison.OrdinalIgnoreCase));
+        }
+
+        foreach (var filePath in Directory.GetFiles(sourceDir, "*", SearchOption.AllDirectories))
+        {
+            var destPath = filePath.Replace(sourceDir, destinationDir, StringComparison.OrdinalIgnoreCase);
+            if (!string.IsNullOrWhiteSpace(preserveFileName)
+                && string.Equals(Path.GetFileName(filePath), preserveFileName, StringComparison.OrdinalIgnoreCase)
+                && File.Exists(destPath))
+            {
+                continue;
+            }
+
+            var destFolder = Path.GetDirectoryName(destPath);
+            if (!string.IsNullOrWhiteSpace(destFolder))
+            {
+                Directory.CreateDirectory(destFolder);
+            }
+            File.Copy(filePath, destPath, overwrite);
+        }
+    }
+
+    private void EnsurePluggableTransportConfig(string configPath)
+    {
+        if (!File.Exists(configPath))
+        {
+            return;
+        }
+
+        try
+        {
+            var json = File.ReadAllText(configPath);
+            var config = JsonSerializer.Deserialize<PluggableTransportConfig>(json, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            });
+            if (config == null)
+            {
+                return;
+            }
+
+            var updated = false;
+            config.PluggableTransports ??= new Dictionary<string, string>();
+            if (!config.PluggableTransports.ContainsKey("lyrebird"))
+            {
+                config.PluggableTransports["lyrebird"] =
+                    "ClientTransportPlugin meek_lite,obfs2,obfs3,obfs4,scramblesuit exec ${pt_path}lyrebird.exe";
+                updated = true;
+            }
+
+            if (!config.PluggableTransports.ContainsKey("webtunnel"))
+            {
+                config.PluggableTransports["webtunnel"] =
+                    "ClientTransportPlugin webtunnel exec ${pt_path}webtunnel-client.exe";
+                updated = true;
+            }
+
+            if (updated)
+            {
+                var updatedJson = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(configPath, updatedJson);
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Bridge config update failed: {ex.Message}");
         }
     }
 
@@ -1324,7 +1959,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         try
         {
             AppendLog("Checking for updates...");
-            var latest = await GetLatestReleaseAsync();
+            var latest = await _updateService.GetLatestReleaseAsync(UpdateApiUrl);
             if (latest == null)
             {
                 AppendLog("Update check failed.");
@@ -1364,7 +1999,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 return;
             }
 
-            var installerPath = await DownloadUpdateAsync(latest);
+            var installerPath = await _updateService.DownloadUpdateAsync(latest);
             if (string.IsNullOrWhiteSpace(installerPath))
             {
                 OpenUpdatePage(latest.HtmlUrl);
@@ -1420,46 +2055,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return new Version(0, 0, 0);
     }
 
-    private async Task<UpdateInfo?> GetLatestReleaseAsync()
-    {
-        using var client = new HttpClient();
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("OnionHop");
-
-        using var response = await client.GetAsync(UpdateApiUrl);
-        if (!response.IsSuccessStatusCode)
-        {
-            return null;
-        }
-
-        var json = await response.Content.ReadAsStringAsync();
-        var release = JsonSerializer.Deserialize<GitHubRelease>(json);
-        if (release == null)
-        {
-            return null;
-        }
-
-        var latestVersion = ParseVersion(release.TagName);
-        if (latestVersion.Major == 0 && latestVersion.Minor == 0 && latestVersion.Build == 0)
-        {
-            return null;
-        }
-
-        var asset = release.Assets?
-            .FirstOrDefault(a => a.Name != null
-                                 && a.Name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
-                                 && a.Name.Contains("OnionHop", StringComparison.OrdinalIgnoreCase))
-            ?? release.Assets?.FirstOrDefault(a => a.Name != null
-                                                  && a.Name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase));
-
-        return new UpdateInfo
-        {
-            Version = latestVersion,
-            DownloadUrl = asset?.BrowserDownloadUrl,
-            HtmlUrl = release.HtmlUrl,
-            FileName = asset?.Name
-        };
-    }
-
     private static void OpenUpdatePage(string? url)
     {
         if (string.IsNullOrWhiteSpace(url))
@@ -1471,67 +2066,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
         }
-        catch
+        catch (Exception ex)
         {
+            StartupLogger.Write($"Failed to open update page: {ex.Message}");
         }
-    }
-
-    private static async Task<string?> DownloadUpdateAsync(UpdateInfo info)
-    {
-        if (string.IsNullOrWhiteSpace(info.DownloadUrl))
-        {
-            return null;
-        }
-
-        var updatesDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OnionHop", "updates");
-        Directory.CreateDirectory(updatesDir);
-        var fileName = string.IsNullOrWhiteSpace(info.FileName)
-            ? $"OnionHop-Setup-{info.Version}.exe"
-            : info.FileName;
-        var targetPath = Path.Combine(updatesDir, fileName);
-
-        using var client = new HttpClient();
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("OnionHop");
-
-        using var response = await client.GetAsync(info.DownloadUrl);
-        if (!response.IsSuccessStatusCode)
-        {
-            return null;
-        }
-
-        await using var stream = await response.Content.ReadAsStreamAsync();
-        await using var file = new FileStream(targetPath, FileMode.Create, FileAccess.Write, FileShare.None);
-        await stream.CopyToAsync(file);
-        return targetPath;
-    }
-
-    private sealed class UpdateInfo
-    {
-        public Version Version { get; init; } = new Version(0, 0, 0);
-        public string? DownloadUrl { get; init; }
-        public string? HtmlUrl { get; init; }
-        public string? FileName { get; init; }
-    }
-
-    private sealed class GitHubRelease
-    {
-        [JsonPropertyName("tag_name")]
-        public string? TagName { get; set; }
-
-        [JsonPropertyName("html_url")]
-        public string? HtmlUrl { get; set; }
-
-        [JsonPropertyName("assets")]
-        public List<GitHubAsset>? Assets { get; set; }
-    }
-
-    private sealed class GitHubAsset
-    {
-        [JsonPropertyName("name")]
-        public string? Name { get; set; }
-
-        [JsonPropertyName("browser_download_url")]
-        public string? BrowserDownloadUrl { get; set; }
     }
 
     private async void ConnectButton_Click(object sender, RoutedEventArgs e)
@@ -1541,12 +2079,23 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             return;
         }
 
+        if (IsDependencyDownloadInProgress)
+        {
+            StatusMessage = "Downloading components. Please wait.";
+            return;
+        }
+
         if (_isConnected)
         {
             await DisconnectAsync();
         }
         else
         {
+            if (!await EnsureDependenciesAsync())
+            {
+                return;
+            }
+
             await ConnectAsync();
         }
     }
@@ -1569,7 +2118,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async void ChangeIdentityButton_Click(object sender, RoutedEventArgs e)
     {
-        if (!_isConnected || _torProcess == null)
+        if (!_isConnected || !_torService.IsRunning)
         {
             StatusMessage = "Connect to Tor before requesting a new identity.";
             return;
@@ -1616,7 +2165,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             return;
         }
 
-        if (IsTunMode && !EnsureAdministratorOrRelaunch())
+        if (IsTunMode && !await EnsureVpnPrivilegesAsync())
         {
             return;
         }
@@ -1673,6 +2222,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             }
 
             _isConnected = true;
+            _viewModel.IsConnected = true;
             Raise(nameof(ConnectButtonText));
             ConnectionStatus = "Connected";
             StatusBrush = new SolidColorBrush(Color.FromRgb(69, 201, 147));
@@ -1690,9 +2240,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         catch (OperationCanceledException)
         {
             AppendLog("Connect timed out.");
-            StopSingBoxProcess();
-
-            _ = Task.Run(() => DisableKillSwitchEmergencyBlock());
+            StopSingBoxProcess(allowElevation: IsTunMode);
+            if (IsTunMode && KillSwitchEnabled && !UseHybridRouting)
+            {
+                _ = Task.Run(() => DisableKillSwitchEmergencyBlock());
+            }
             StatusMessage = "Tor connection timed out.";
             ConnectionStatus = "Disconnected";
             StatusBrush = new SolidColorBrush(Color.FromRgb(209, 67, 75));
@@ -1709,7 +2261,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         catch (Exception ex)
         {
             AppendLog($"Connect failed: {ex.Message}");
-            StopSingBoxProcess();
+            StopSingBoxProcess(allowElevation: IsTunMode);
+            if (IsTunMode && KillSwitchEnabled && !UseHybridRouting)
+            {
+                _ = Task.Run(() => DisableKillSwitchEmergencyBlock());
+            }
             StatusMessage = $"Failed to connect: {ex.Message}";
             ConnectionStatus = "Disconnected";
             StatusBrush = new SolidColorBrush(Color.FromRgb(209, 67, 75));
@@ -1785,9 +2341,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         ConnectionStatus = "Disconnecting...";
         ConnectionProgress = 0.2;
 
-        StopSingBoxProcess();
-
-        _ = Task.Run(() => DisableKillSwitchEmergencyBlock());
+        StopSingBoxProcess(allowElevation: IsTunMode);
+        if (IsTunMode && KillSwitchEnabled && !UseHybridRouting)
+        {
+            _ = Task.Run(() => DisableKillSwitchEmergencyBlock());
+        }
 
         if (_systemProxyApplied)
         {
@@ -1798,6 +2356,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         await Task.Delay(300);
 
         _isConnected = false;
+        _viewModel.IsConnected = false;
         _isDisconnecting = false;
         Raise(nameof(ConnectButtonText));
         UpdateConnectVisualState();
@@ -1808,6 +2367,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         CurrentIp = "--.--.--.--";
     }
 
+    private const int MaxLogLines = 500;
+    private const int LogTrimBatchSize = 50;
+
     private void AppendLog(string message)
     {
         var line = $"{DateTime.Now:HH:mm:ss} {message}";
@@ -1816,12 +2378,43 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             lock (_logLock)
             {
                 LogLines.Add(line);
-                while (LogLines.Count > 500)
+                
+                // Batch removal is more efficient than removing one at a time
+                if (LogLines.Count > MaxLogLines + LogTrimBatchSize)
                 {
-                    LogLines.RemoveAt(0);
+                    var toRemove = LogLines.Count - MaxLogLines;
+                    for (var i = 0; i < toRemove; i++)
+                    {
+                        LogLines.RemoveAt(0);
+                    }
                 }
             }
         });
+    }
+
+
+    private void TryAssignProcessToJob(Process process, string name)
+    {
+        if (_processJob == null)
+        {
+            return;
+        }
+
+        if (!_processJob.TryAddProcess(process, out var error))
+        {
+            if (error == 0)
+            {
+                return;
+            }
+
+            if (error == JobObject.ErrorAccessDenied)
+            {
+                AppendLog($"Process job attach skipped for {name} (already in another job).");
+                return;
+            }
+
+            AppendLog($"Process job attach failed for {name}: Win32 {error}.");
+        }
     }
 
     private void CloseOverlay_Click(object sender, RoutedEventArgs e)
@@ -1900,179 +2493,33 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async Task StartSingBoxVpnAsync(CancellationToken token)
     {
-        StopSingBoxProcess();
+        StopSingBoxProcess(allowElevation: false);
 
         var singBoxPath = Path.Combine(AppContext.BaseDirectory, DefaultSingBoxRelativePath);
-        if (!File.Exists(singBoxPath))
-        {
-            throw new FileNotFoundException("VPN component missing: vpn\\sing-box.exe", singBoxPath);
-        }
-
         var wintunPath = Path.Combine(AppContext.BaseDirectory, DefaultWintunRelativePath);
-        if (!File.Exists(wintunPath))
+        var config = new VpnLaunchConfig
         {
-            throw new FileNotFoundException("VPN component missing: vpn\\wintun.dll", wintunPath);
-        }
-
-        var workDir = Path.GetDirectoryName(singBoxPath) ?? AppContext.BaseDirectory;
-        var configDir = Path.Combine(Path.GetTempPath(), "OnionHop", "sing-box");
-        Directory.CreateDirectory(configDir);
-        var configPath = Path.Combine(configDir, "sing-box.json");
-        await File.WriteAllTextAsync(configPath, BuildSingBoxConfigJson(UseHybridRouting, UseCensoredMode), token);
-
-        AppendLog($"Starting sing-box with config: {configPath}");
-
-        var psi = new ProcessStartInfo(singBoxPath, $"run -c \"{configPath}\"")
-        {
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-            WorkingDirectory = workDir
+            SingBoxPath = singBoxPath,
+            WintunPath = wintunPath,
+            HybridRouting = UseHybridRouting,
+            SecureDns = UseCensoredMode,
+            SocksPort = SocksPort,
+            BrowserProcessNames = BrowserProcessNames,
+            ProcessStarted = process => TryAssignProcessToJob(process, "sing-box")
         };
 
-        _singBoxProcess = new Process
+        if (!IsAdministrator())
         {
-            StartInfo = psi,
-            EnableRaisingEvents = true
-        };
-
-        _singBoxProcess.Exited += OnSingBoxExited;
-
-        _singBoxProcess.OutputDataReceived += OnSingBoxDataReceived;
-        _singBoxProcess.ErrorDataReceived += OnSingBoxDataReceived;
-
-        if (!_singBoxProcess.Start())
-        {
-            throw new InvalidOperationException("Unable to launch sing-box.exe");
-        }
-
-        _singBoxProcess.BeginOutputReadLine();
-        _singBoxProcess.BeginErrorReadLine();
-        await Task.Delay(750, token);
-
-        if (_singBoxProcess.HasExited)
-        {
-            throw new InvalidOperationException("sing-box exited unexpectedly during startup.");
-        }
-    }
-
-    private static string BuildSingBoxConfigJson(bool hybridRouting, bool secureDns)
-    {
-        var rules = new List<object>
-        {
-            new { action = "sniff" },
-            new { process_name = "tor.exe", outbound = "direct" },
-            new { ip_is_private = true, outbound = "direct" }
-        };
-
-        if (!hybridRouting)
-        {
-            rules.Insert(1, new { protocol = "dns", action = "hijack-dns" });
-            rules.Add(new { network = "udp", outbound = "block" });
-        }
-        else
-        {
-            rules.Insert(1, new { protocol = "dns", action = "hijack-dns" });
-            rules.Add(new { process_name = BrowserProcessNames, network = "udp", port = 443, outbound = "block" });
-            rules.Add(new { process_name = BrowserProcessNames, network = "udp", outbound = "block" });
-            rules.Add(new { process_name = BrowserProcessNames, outbound = "tor" });
-            rules.Add(new { network = "tcp", port = new[] { 80, 443 }, outbound = "tor" });
-        }
-
-        object dnsServer = secureDns
-            ? hybridRouting
-                ? new
-                {
-                    tag = "remote",
-                    type = "https",
-                    server = "cloudflare-dns.com",
-                    server_port = 443,
-                    path = "/dns-query"
-                }
-                : new
-                {
-                    tag = "remote",
-                    type = "https",
-                    server = "cloudflare-dns.com",
-                    server_port = 443,
-                    path = "/dns-query",
-                    detour = "tor"
-                }
-            : hybridRouting
-                ? new
-                {
-                    tag = "remote",
-                    type = "udp",
-                    server = "1.1.1.1",
-                    server_port = 53
-                }
-                : new
-                {
-                    tag = "remote",
-                    type = "tcp",
-                    server = "1.1.1.1",
-                    server_port = 53,
-                    detour = "tor"
-                };
-
-        var config = new
-        {
-            log = new
+            if (!await _adminHelper.StartVpnAsync(config).ConfigureAwait(false))
             {
-                level = "info",
-                timestamp = true
-            },
-            dns = new
-            {
-                servers = new object[]
-                {
-                    dnsServer
-                },
-                final = "remote"
-            },
-            inbounds = new object[]
-            {
-                new
-                {
-                    type = "tun",
-                    tag = "tun-in",
-                    interface_name = "OnionHop",
-                    address = new[] { "172.19.0.1/30" },
-                    auto_route = true,
-                    strict_route = true
-                }
-            },
-            outbounds = new object[]
-            {
-                new
-                {
-                    type = "socks",
-                    tag = "tor",
-                    server = "127.0.0.1",
-                    server_port = SocksPort,
-                    version = "5"
-                },
-                new
-                {
-                    type = "direct",
-                    tag = "direct"
-                },
-                new
-                {
-                    type = "block",
-                    tag = "block"
-                }
-            },
-            route = new
-            {
-                auto_detect_interface = true,
-                rules = rules,
-                final = hybridRouting ? "direct" : "tor"
+                throw new InvalidOperationException("Unable to start elevated VPN helper.");
             }
-        };
 
-        return JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
+            StartAdminVpnMonitor();
+            return;
+        }
+
+        await _vpnService.StartAsync(config, token);
     }
 
     private void OnSingBoxDataReceived(object sender, DataReceivedEventArgs e)
@@ -2134,7 +2581,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         var exitCode = 0;
         try
         {
-            exitCode = _singBoxProcess?.ExitCode ?? 0;
+            exitCode = _vpnService.ExitCode ?? 0;
         }
         catch
         {
@@ -2173,52 +2620,97 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             Dispatcher.BeginInvoke(new Action(() => _ = DisconnectAsync()));
         }
-        catch
+        catch (Exception ex)
         {
+            StartupLogger.Write($"OnSingBoxExited: Failed to invoke disconnect: {ex.Message}");
         }
     }
 
-    private void StopSingBoxProcess()
+    private void StopSingBoxProcess(bool allowElevation = true)
     {
-        if (_singBoxProcess == null)
-        {
-            return;
-        }
+        _adminVpnMonitorCts?.Cancel();
+        _adminVpnMonitorCts = null;
 
-        try
+        if (!IsAdministrator())
         {
-            if (!_singBoxProcess.HasExited)
-            {
-                try
-                {
-                    _singBoxProcess.CloseMainWindow();
-                    _singBoxProcess.WaitForExit(1500);
-                }
-                catch
-                {
-                }
-
-                _singBoxProcess.Kill(true);
-                _singBoxProcess.WaitForExit(5000);
-            }
-        }
-        catch (Exception ex)
-        {
-            AppendLog($"Failed to stop sing-box: {ex.Message}");
-        }
-        finally
-        {
-            _singBoxProcess.Exited -= OnSingBoxExited;
-            _singBoxProcess.OutputDataReceived -= OnSingBoxDataReceived;
-            _singBoxProcess.ErrorDataReceived -= OnSingBoxDataReceived;
-            _singBoxProcess.Dispose();
-            _singBoxProcess = null;
-
+            // Never start the admin helper just to stop VPN
+            // Only try to stop if helper is already running
+            _ = Task.Run(async () => await _adminHelper.StopVpnIfAvailableAsync().ConfigureAwait(false));
             lock (_singBoxLogLock)
             {
                 _singBoxRecentLines.Clear();
             }
+            return;
         }
+
+        _vpnService.Stop();
+        lock (_singBoxLogLock)
+        {
+            _singBoxRecentLines.Clear();
+        }
+    }
+
+    private void StartAdminVpnMonitor()
+    {
+        _adminVpnMonitorCts?.Cancel();
+        _adminVpnMonitorCts = new CancellationTokenSource();
+        var token = _adminVpnMonitorCts.Token;
+
+        _ = Task.Run(async () =>
+        {
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(3000, token).ConfigureAwait(false);
+                    var status = await _adminHelper.GetStatusAsync().ConfigureAwait(false);
+                    if (status == null)
+                    {
+                        AppendLog("VPN helper unavailable. Disconnecting...");
+                        Dispatcher.Invoke(() =>
+                        {
+                            ConnectionStatus = "VPN stopped";
+                            StatusBrush = new SolidColorBrush(Color.FromRgb(209, 67, 75));
+                            StatusMessage = "VPN helper unavailable. Disconnecting...";
+                        });
+                        _ = Dispatcher.InvokeAsync(DisconnectAsync);
+                        return;
+                    }
+
+                    if (status.VpnRunning)
+                    {
+                        continue;
+                    }
+
+                    if (_isDisconnecting || !_isConnected || !IsTunMode)
+                    {
+                        return;
+                    }
+
+                    if (KillSwitchEnabled && !UseHybridRouting)
+                    {
+                        EnableKillSwitchEmergencyBlock();
+                    }
+
+                    AppendLog("VPN helper stopped unexpectedly. Disconnecting...");
+                    Dispatcher.Invoke(() =>
+                    {
+                        ConnectionStatus = "VPN stopped";
+                        StatusBrush = new SolidColorBrush(Color.FromRgb(209, 67, 75));
+                        StatusMessage = "VPN helper stopped unexpectedly. Disconnecting...";
+                    });
+                    _ = Dispatcher.InvokeAsync(DisconnectAsync);
+                    return;
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch
+                {
+                }
+            }
+        }, token);
     }
 
     private static bool IsAdministrator()
@@ -2235,64 +2727,21 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
-    private bool EnsureAdministratorOrRelaunch()
+    private async Task<bool> EnsureVpnPrivilegesAsync()
     {
         if (IsAdministrator())
         {
             return true;
         }
 
-        var exePath = Environment.ProcessPath;
-        if (string.IsNullOrWhiteSpace(exePath))
+        StatusMessage = "Starting elevated VPN helper...";
+        if (await _adminHelper.EnsureConnectedAsync())
         {
-            StatusMessage = "VPN mode requires Administrator. Please restart OnionHop as admin.";
-            return false;
+            return true;
         }
 
-        var args = new StringBuilder();
-        args.Append("--connect ");
-        args.Append("--vpn ");
-        args.Append(UseHybridRouting ? "--hybrid " : "--strict ");
-        args.Append("--location ");
-        args.Append('"').Append(SelectedLocation.Replace("\"", string.Empty)).Append('"');
-
-        try
-        {
-            if (Application.Current is App app)
-            {
-                app.ReleaseSingleInstance();
-            }
-
-            var psi = new ProcessStartInfo(exePath)
-            {
-                UseShellExecute = true,
-                Verb = "runas",
-                Arguments = args.ToString()
-            };
-            var started = Process.Start(psi);
-            if (started == null)
-            {
-                if (Application.Current is App retryApp)
-                {
-                    retryApp.TryReacquireSingleInstance();
-                }
-
-                StatusMessage = "Unable to relaunch as Administrator.";
-                return false;
-            }
-            Application.Current.Shutdown();
-            return false;
-        }
-        catch
-        {
-            if (Application.Current is App retryApp)
-            {
-                retryApp.TryReacquireSingleInstance();
-            }
-
-            StatusMessage = "VPN mode requires Administrator permission.";
-            return false;
-        }
+        StatusMessage = "VPN mode requires Administrator. Helper could not be started.";
+        return false;
     }
 
     private void ApplyStartupArguments(string[] args)
@@ -2371,6 +2820,18 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             _ptConfig.Bridges.TryGetValue(SelectedBridgeType, out var bridges) &&
             bridges.Count > 0)
         {
+            if (string.Equals(SelectedBridgeType, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase))
+            {
+                var filtered = bridges.Where(line => !IsPlaceholderBridgeLine(line)).ToList();
+                if (filtered.Count == 0)
+                {
+                    AppendLog("No usable webtunnel bridges. Get bridges from bridges.torproject.org and paste in Custom Bridges.");
+                    return Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
+                }
+
+                return Task.FromResult<IReadOnlyList<string>>(filtered);
+            }
+
             return Task.FromResult<IReadOnlyList<string>>(bridges);
         }
 
@@ -2599,6 +3060,23 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             return true;
         }
 
+        // Webtunnel bridges use documentation IPs but connect via url= parameter
+        // So don't filter them out if they have a real URL
+        if (bridgeLine.StartsWith("webtunnel", StringComparison.OrdinalIgnoreCase) 
+            && bridgeLine.Contains("url=", StringComparison.OrdinalIgnoreCase))
+        {
+            // Check if the URL looks like a real domain (not example.com/test.invalid)
+            var urlMatch = Regex.Match(bridgeLine, @"url=https?://([^/\s]+)", RegexOptions.IgnoreCase);
+            if (urlMatch.Success)
+            {
+                var host = urlMatch.Groups[1].Value.ToLowerInvariant();
+                if (!host.Contains("example.") && !host.Contains(".invalid") && !host.Contains(".test"))
+                {
+                    return false; // Real webtunnel bridge
+                }
+            }
+        }
+
         return bridgeLine.Contains("2001:db8", StringComparison.OrdinalIgnoreCase)
             || bridgeLine.Contains("192.0.2.", StringComparison.OrdinalIgnoreCase)
             || bridgeLine.Contains("198.51.100.", StringComparison.OrdinalIgnoreCase)
@@ -2662,36 +3140,22 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _bootstrapSource = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         using var registration = token.Register(() => _bootstrapSource.TrySetCanceled(token));
 
-        var dataDir = Path.Combine(Path.GetTempPath(), "OnionHop", "tor-data");
-        Directory.CreateDirectory(dataDir);
-        _torDataDirectory = dataDir;
-        _torControlPort = null;
-        var controlPortFile = Path.Combine(dataDir, ControlPortFileName);
-        TryDeleteFile(controlPortFile);
-        TryDeleteFile(Path.Combine(dataDir, ControlAuthCookieFileName));
-
-        var argsBuilder = new StringBuilder();
-        argsBuilder.Append($"--SocksPort {SocksPort} ");
-        argsBuilder.Append($"--DataDirectory \"{dataDir}\" ");
-        argsBuilder.Append("--ClientOnly 1 ");
-        argsBuilder.Append("--Log \"notice stdout\" ");
-        argsBuilder.Append("--CookieAuthentication 1 ");
-        argsBuilder.Append("--ControlPort auto ");
-        argsBuilder.Append($"--ControlPortWriteToFile \"{controlPortFile}\" ");
         var torDir = Path.GetDirectoryName(torPath) ?? AppContext.BaseDirectory;
-        argsBuilder.Append($"--GeoIPFile \"{Path.Combine(torDir, "geoip")}\" ");
-        argsBuilder.Append($"--GeoIPv6File \"{Path.Combine(torDir, "geoip6")}\" ");
+        var geoIpPath = Path.Combine(torDir, "geoip");
+        var geoIp6Path = Path.Combine(torDir, "geoip6");
 
+        IReadOnlyList<string>? bridgeLines = null;
+        List<string>? normalizedPlugins = null;
         if (UseTorBridges)
         {
-            var bridgeLines = await GetBridgeLinesAsync(token);
+            bridgeLines = await GetBridgeLinesAsync(token);
             if (bridgeLines.Count == 0)
             {
                 var message = _bridgeValidationMessage;
                 if (string.IsNullOrWhiteSpace(message))
                 {
                     message = string.Equals(SelectedBridgeType, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase)
-                        ? "Webtunnel bridges must be pasted from BridgeDB (bridges.torproject.org or bridges@torproject.org)."
+                        ? "Webtunnel bridges require manual setup. Visit bridges.torproject.org, select 'webtunnel', solve the CAPTCHA, and paste the bridge lines in Custom Bridges."
                         : "Bridges enabled but no bridge lines are configured.";
                 }
                 throw new InvalidOperationException(message);
@@ -2708,205 +3172,43 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 throw new InvalidOperationException(message);
             }
 
-            argsBuilder.Append("--UseBridges 1 ");
-            foreach (var pluginLine in pluginLines)
-            {
-                var normalized = NormalizeClientTransportPlugin(pluginLine);
-                if (!string.IsNullOrWhiteSpace(normalized))
-                {
-                    argsBuilder.Append($"--ClientTransportPlugin \"{normalized}\" ");
-                }
-            }
+            normalizedPlugins = pluginLines
+                .Select(NormalizeClientTransportPlugin)
+                .Where(normalized => !string.IsNullOrWhiteSpace(normalized))
+                .ToList();
 
-            foreach (var bridgeLine in bridgeLines)
+            if (normalizedPlugins.Count == 0)
             {
-                argsBuilder.Append($"--Bridge \"{bridgeLine}\" ");
+                var message = _bridgeValidationMessage;
+                if (string.IsNullOrWhiteSpace(message))
+                {
+                    message = "Bridges enabled but no transport plugins were found.";
+                }
+                throw new InvalidOperationException(message);
             }
         }
 
         var countryCode = GetCountryCode(location);
-        if (!string.IsNullOrWhiteSpace(countryCode))
+        var config = new TorLaunchConfig
         {
-            argsBuilder.Append($"--ExitNodes {{{countryCode}}} ");
-        }
-
-        var psi = new ProcessStartInfo(torPath, argsBuilder.ToString())
-        {
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-            WorkingDirectory = Path.GetDirectoryName(torPath) ?? AppContext.BaseDirectory
+            TorPath = torPath,
+            SocksPort = SocksPort,
+            GeoIpPath = geoIpPath,
+            GeoIp6Path = geoIp6Path,
+            BridgeLines = bridgeLines,
+            ClientTransportPlugins = normalizedPlugins,
+            ExitCountryCode = countryCode,
+            ProcessStarted = process => TryAssignProcessToJob(process, "tor")
         };
 
-        _torProcess = new Process
-        {
-            StartInfo = psi,
-            EnableRaisingEvents = true
-        };
-
-        _torProcess.Exited += OnTorExited;
-
-        _torProcess.OutputDataReceived += OnTorDataReceived;
-        _torProcess.ErrorDataReceived += OnTorDataReceived;
-
-        if (!_torProcess.Start())
-        {
-            throw new InvalidOperationException("Unable to launch tor.exe");
-        }
-
-        _torProcess.BeginOutputReadLine();
-        _torProcess.BeginErrorReadLine();
+        await _torService.StartAsync(config, token);
 
         await _bootstrapSource.Task;
     }
 
     private async Task<bool> SendTorControlSignalAsync(string command, CancellationToken token)
     {
-        var port = await GetTorControlPortAsync(token);
-        if (!port.HasValue)
-        {
-            AppendLog("Tor control port not available.");
-            return false;
-        }
-
-        var cookie = await GetTorControlCookieHexAsync(token);
-        if (string.IsNullOrWhiteSpace(cookie))
-        {
-            AppendLog("Tor control cookie not available.");
-            return false;
-        }
-
-        using var client = new TcpClient();
-        await client.ConnectAsync(IPAddress.Loopback, port.Value, token);
-
-        await using var stream = client.GetStream();
-        using var reader = new StreamReader(stream, Encoding.ASCII);
-        using var writer = new StreamWriter(stream, Encoding.ASCII)
-        {
-            NewLine = "\r\n",
-            AutoFlush = true
-        };
-
-        await writer.WriteLineAsync($"AUTHENTICATE {cookie}");
-        var authResponse = await ReadControlResponseAsync(reader);
-        if (!authResponse.StartsWith("250", StringComparison.Ordinal))
-        {
-            AppendLog($"Tor control auth failed: {authResponse}");
-            return false;
-        }
-
-        await writer.WriteLineAsync(command);
-        var response = await ReadControlResponseAsync(reader);
-        if (!response.StartsWith("250", StringComparison.Ordinal))
-        {
-            AppendLog($"Tor control command failed: {response}");
-            return false;
-        }
-
-        await writer.WriteLineAsync("QUIT");
-        return true;
-    }
-
-    private async Task<int?> GetTorControlPortAsync(CancellationToken token)
-    {
-        if (_torControlPort.HasValue)
-        {
-            return _torControlPort.Value;
-        }
-
-        if (string.IsNullOrWhiteSpace(_torDataDirectory))
-        {
-            return null;
-        }
-
-        var portFile = Path.Combine(_torDataDirectory, ControlPortFileName);
-        for (var attempt = 0; attempt < 12; attempt++)
-        {
-            if (File.Exists(portFile))
-            {
-                var content = await File.ReadAllTextAsync(portFile, token);
-                var parsed = ParsePortFromFile(content);
-                if (parsed.HasValue)
-                {
-                    _torControlPort = parsed.Value;
-                    return _torControlPort;
-                }
-            }
-
-            await Task.Delay(200, token);
-        }
-
-        return null;
-    }
-
-    private async Task<string?> GetTorControlCookieHexAsync(CancellationToken token)
-    {
-        if (string.IsNullOrWhiteSpace(_torDataDirectory))
-        {
-            return null;
-        }
-
-        var cookiePath = Path.Combine(_torDataDirectory, ControlAuthCookieFileName);
-        for (var attempt = 0; attempt < 12; attempt++)
-        {
-            if (File.Exists(cookiePath))
-            {
-                var bytes = await File.ReadAllBytesAsync(cookiePath, token);
-                if (bytes.Length > 0)
-                {
-                    return BitConverter.ToString(bytes).Replace("-", string.Empty).ToLowerInvariant();
-                }
-            }
-
-            await Task.Delay(200, token);
-        }
-
-        return null;
-    }
-
-    private static async Task<string> ReadControlResponseAsync(StreamReader reader)
-    {
-        var line = await reader.ReadLineAsync() ?? string.Empty;
-        if (!line.StartsWith("250-", StringComparison.Ordinal))
-        {
-            return line;
-        }
-
-        var current = line;
-        while (current.StartsWith("250-", StringComparison.Ordinal))
-        {
-            var next = await reader.ReadLineAsync();
-            if (next == null)
-            {
-                break;
-            }
-
-            current = next;
-            if (current.StartsWith("250 ", StringComparison.Ordinal))
-            {
-                break;
-            }
-        }
-
-        return current;
-    }
-
-    private static int? ParsePortFromFile(string content)
-    {
-        if (string.IsNullOrWhiteSpace(content))
-        {
-            return null;
-        }
-
-        var matches = Regex.Matches(content, @"\d+");
-        if (matches.Count == 0)
-        {
-            return null;
-        }
-
-        var match = matches[^1];
-        return int.TryParse(match.Value, out var port) ? port : null;
+        return await _torService.SendControlSignalAsync(command, token);
     }
 
     private void OnTorDataReceived(object? sender, DataReceivedEventArgs e)
@@ -2966,15 +3268,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             if (SystemWideMode && !UseHybridRouting)
             {
-                using var handler = new HttpClientHandler
-                {
-                    UseProxy = true
-                };
-
-                using var client = new HttpClient(handler)
-                {
-                    Timeout = TimeSpan.FromSeconds(35)
-                };
+                // Need custom handler for proxy, can't use singleton here
+                using var handler = new HttpClientHandler { UseProxy = true };
+                using var client = HttpClientFactory.CreateWithHandler(handler, TimeSpan.FromSeconds(35));
 
                 var response = await client.GetAsync("https://check.torproject.org/api/ip");
                 response.EnsureSuccessStatusCode();
@@ -2994,8 +3290,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             }
             else
             {
-                using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
-                CurrentIp = await client.GetStringAsync("https://api.ipify.org");
+                CurrentIp = await HttpClientFactory.Default.GetStringAsync("https://api.ipify.org");
                 StatusMessage = SystemWideMode
                     ? "Hybrid mode: your browser is routed via Tor. Current IP shows your normal route."
                     : "IP refreshed.";
@@ -3005,8 +3300,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             try
             {
-                using var fallbackClient = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
-                CurrentIp = await fallbackClient.GetStringAsync("https://api.ipify.org");
+                CurrentIp = await HttpClientFactory.Default.GetStringAsync("https://api.ipify.org");
                 StatusMessage = "IP fetched via standard route (Tor lookup failed).";
             }
             catch (Exception ex)
@@ -3018,60 +3312,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void StopTorProcess()
     {
-        if (_torProcess == null)
-        {
-            return;
-        }
-
-        try
-        {
-            if (_torProcess != null)
-            {
-                _torProcess.Exited -= OnTorExited;
-                if (!_torProcess.HasExited)
-                {
-                    try
-                    {
-                        _torProcess.CloseMainWindow();
-                        _torProcess.WaitForExit(1500);
-                    }
-                    catch
-                    {
-                    }
-
-                    _torProcess.Kill(true);
-                    _torProcess.WaitForExit(5000);
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            AppendLog($"Failed to stop Tor: {ex.Message}");
-        }
-        finally
-        {
-            _torProcess.OutputDataReceived -= OnTorDataReceived;
-            _torProcess.ErrorDataReceived -= OnTorDataReceived;
-            _torProcess.Dispose();
-            _torProcess = null;
-            _torControlPort = null;
-            _torDataDirectory = null;
-            _lastNewnymUtc = DateTime.MinValue;
-        }
-    }
-
-    private static void TryDeleteFile(string path)
-    {
-        try
-        {
-            if (File.Exists(path))
-            {
-                File.Delete(path);
-            }
-        }
-        catch
-        {
-        }
+        _torService.Stop();
+        _lastNewnymUtc = DateTime.MinValue;
     }
 
     private void ApplySystemProxy(bool enable)
@@ -3146,10 +3388,31 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             ApplySystemProxy(false);
         }
 
-        DisableKillSwitchEmergencyBlock();
+        DisableKillSwitchEmergencyBlock(allowElevation: false);
 
-        StopSingBoxProcess();
+        StopSingBoxProcess(allowElevation: false);
         StopTorProcess();
+        
+        // Shutdown admin helper if connected (don't wait forever)
+        try
+        {
+            if (_adminHelper.IsConnected)
+            {
+                _adminHelper.ShutdownIfConnectedAsync().Wait(TimeSpan.FromSeconds(2));
+            }
+        }
+        catch (Exception ex)
+        {
+            StartupLogger.Write($"OnClosed: Admin helper shutdown failed: {ex.Message}");
+        }
+        _adminHelper.Dispose();
+        
+        // Kill any orphaned helper processes
+        KillOrphanedHelperProcesses();
+        _vpnService.Dispose();
+        _torService.Dispose();
+        _processJob?.Dispose();
+        _processJob = null;
 
         if (_trayIcon != null)
         {
@@ -3166,6 +3429,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     }
 
     private static string GetKillSwitchRuleName() => "OnionHop KillSwitch Emergency Block";
+    private static string GetKillSwitchCleanupTaskName() => "OnionHop KillSwitch Cleanup";
 
     private void EnableKillSwitchEmergencyBlock()
     {
@@ -3173,12 +3437,26 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             if (!IsAdministrator())
             {
-                AppendLog("Kill switch could not be enabled (admin required).");
+                _ = Task.Run(async () =>
+                {
+                    if (await _adminHelper.EnsureConnectedAsync().ConfigureAwait(false))
+                    {
+                        await _adminHelper.EnableKillSwitchAsync().ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        AppendLog("Kill switch could not be enabled (admin helper unavailable).");
+                    }
+                });
+                AppendLog("Kill switch requested via helper.");
+                Dispatcher.Invoke(() =>
+                    StatusMessage = "Kill switch engaged: traffic blocked to prevent leaks.");
                 return;
             }
 
             RunNetsh($"advfirewall firewall delete rule name=\"{GetKillSwitchRuleName()}\"");
             RunNetsh($"advfirewall firewall add rule name=\"{GetKillSwitchRuleName()}\" dir=out action=block profile=any enable=yes");
+            EnableKillSwitchFailsafe();
             AppendLog("Kill switch engaged: outbound traffic blocked.");
             Dispatcher.Invoke(() =>
                 StatusMessage = "Kill switch engaged: traffic blocked to prevent leaks. Disconnect to restore.");
@@ -3189,7 +3467,42 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
-    private void DisableKillSwitchEmergencyBlock()
+    private void DisableKillSwitchEmergencyBlock(bool allowElevation = true)
+    {
+        try
+        {
+            // Only try to disable if kill switch is actually active
+            if (!IsKillSwitchEmergencyBlockActive())
+            {
+                return;
+            }
+
+            if (!IsAdministrator())
+            {
+                // Never start the admin helper just to disable kill switch
+                // Only try to connect if helper is already running
+                _ = Task.Run(async () =>
+                {
+                    if (!await _adminHelper.DisableKillSwitchIfAvailableAsync().ConfigureAwait(false))
+                    {
+                        if (allowElevation)
+                        {
+                            AppendLog("Kill switch is active but helper unavailable. Run as admin to clear.");
+                        }
+                    }
+                });
+                return;
+            }
+
+            RunNetsh($"advfirewall firewall delete rule name=\"{GetKillSwitchRuleName()}\"");
+            DisableKillSwitchFailsafe();
+        }
+        catch
+        {
+        }
+    }
+
+    private void EnableKillSwitchFailsafe()
     {
         try
         {
@@ -3198,10 +3511,29 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 return;
             }
 
-            RunNetsh($"advfirewall firewall delete rule name=\"{GetKillSwitchRuleName()}\"");
+            var action = $"cmd /c netsh advfirewall firewall delete rule name=\\\"{GetKillSwitchRuleName()}\\\"";
+            RunSchTasks($"/Create /TN \"{GetKillSwitchCleanupTaskName()}\" /TR \"{action}\" /SC ONSTART /RL HIGHEST /RU SYSTEM /F");
         }
-        catch
+        catch (Exception ex)
         {
+            AppendLog($"Kill switch failsafe setup failed: {ex.Message}");
+        }
+    }
+
+    private void DisableKillSwitchFailsafe()
+    {
+        try
+        {
+            if (!IsAdministrator())
+            {
+                return;
+            }
+
+            RunSchTasks($"/Delete /TN \"{GetKillSwitchCleanupTaskName()}\" /F");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Kill switch failsafe cleanup failed: {ex.Message}");
         }
     }
 
@@ -3242,6 +3574,67 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         proc.WaitForExit(8000);
+    }
+
+    private static void RunSchTasks(string args)
+    {
+        var psi = new ProcessStartInfo("schtasks", args)
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+
+        using var proc = Process.Start(psi);
+        if (proc == null)
+        {
+            return;
+        }
+
+        proc.WaitForExit(8000);
+    }
+
+    private static void KillOrphanedHelperProcesses()
+    {
+        try
+        {
+            var currentPid = Environment.ProcessId;
+            var currentExeName = Path.GetFileNameWithoutExtension(Environment.ProcessPath ?? "OnionHop");
+            
+            foreach (var proc in Process.GetProcessesByName(currentExeName))
+            {
+                try
+                {
+                    // Don't kill ourselves
+                    if (proc.Id == currentPid)
+                    {
+                        continue;
+                    }
+                    
+                    // Check if it's a helper process by checking command line
+                    // Helper processes are typically older than us and running elevated
+                    if (!proc.HasExited)
+                    {
+                        proc.Kill();
+                        proc.WaitForExit(1000);
+                        StartupLogger.Write($"Killed orphaned helper process: PID {proc.Id}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    StartupLogger.Write($"Failed to kill orphaned process {proc.Id}: {ex.Message}");
+                }
+                finally
+                {
+                    proc.Dispose();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            StartupLogger.Write($"KillOrphanedHelperProcesses failed: {ex.Message}");
+        }
     }
 
     private static string RunNetshWithOutput(string args)

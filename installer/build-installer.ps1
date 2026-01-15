@@ -1,7 +1,8 @@
 param(
   [string]$Configuration = "Release",
   [string]$Runtime = "win-x64",
-  [switch]$SelfContained
+  [switch]$SelfContained,
+  [switch]$SkipDependencies
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,6 +13,19 @@ $csproj = Join-Path $projectDir "OnionHop.csproj"
 
 if (!(Test-Path $csproj)) {
   throw "Could not find OnionHop.csproj at: $csproj"
+}
+
+$depsScript = Join-Path $repoRoot "download-deps.ps1"
+if (-not $SkipDependencies) {
+  if (!(Test-Path $depsScript)) {
+    throw "Could not find download-deps.ps1 at: $depsScript"
+  }
+
+  Write-Host "Downloading dependencies..." -ForegroundColor Cyan
+  & powershell -NoProfile -ExecutionPolicy Bypass -File $depsScript -NoPause
+  if ($LASTEXITCODE -ne 0) {
+    throw "Dependency download failed with exit code $LASTEXITCODE."
+  }
 }
 
 $sc = "false"

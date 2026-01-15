@@ -643,6 +643,12 @@
                             <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                                 <StackPanel>
                                     <TextBlock Text="About" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                                    <Border Background="{DynamicResource CardBackgroundBrush}" CornerRadius="12" Padding="10" Margin="0,10,0,0">
+                                        <StackPanel>
+                                            <TextBlock Text="{Binding AboutVersionText}" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                                            <TextBlock Text="{Binding AboutReleaseDateText}" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" Margin="0,4,0,0"/>
+                                        </StackPanel>
+                                    </Border>
                                     <TextBlock Text="{Binding AboutText}" Margin="0,10,0,0" TextWrapping="Wrap" Foreground="{DynamicResource PrimaryTextBrush}" FontSize="13"/>
                                 </StackPanel>
                             </ScrollViewer>
@@ -747,7 +753,7 @@
                                                       SelectedItem="{Binding SelectedBridgeType}"
                                                       Style="{StaticResource LightCombo}"
                                                       MaxDropDownHeight="200"/>
-                                            <TextBlock Text="Webtunnel uses webtunnel-client.exe (bundled with Tor Browser). If you only see example lines (2001:db8/192.0.2), request via email (bridges@torproject.org)."
+                                            <TextBlock Text="Webtunnel uses webtunnel-client.exe. OnionHop will try to refresh built-in webtunnel bridges automatically, or you can paste your own."
                                                        FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" Margin="0,8,0,0" TextWrapping="Wrap"/>
 
                                             <TextBlock Text="Custom bridges (optional, one per line). Leave blank to use the built-in list."
@@ -769,7 +775,7 @@
                                         </StackPanel>
                                     </Border>
 
-                                    <TextBlock Text="Kill switch changes Windows Firewall rules. If OnionHop crashes while enabled, you may need to relaunch as Administrator to restore." FontSize="12" Foreground="{DynamicResource TertiaryTextBrush}" Margin="0,18,0,0" TextWrapping="Wrap"/>
+                                    <TextBlock Text="Kill switch changes Windows Firewall rules. A startup cleanup task clears it on reboot if OnionHop cannot." FontSize="12" Foreground="{DynamicResource TertiaryTextBrush}" Margin="0,18,0,0" TextWrapping="Wrap"/>
                                 </StackPanel>
                             </ScrollViewer>
                         </Border>
@@ -778,6 +784,20 @@
                         <TextBlock Text="&#xE711;" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{DynamicResource PrimaryTextBrush}"/>
                     </Button>
                 </Grid>
+            </Border>
+        </Grid>
+
+        <Grid Grid.RowSpan="2" Background="{DynamicResource OverlayScrimBrush}"
+              Visibility="{Binding IsDependencyDownloadInProgress, Converter={StaticResource BoolToVis}}"
+              Panel.ZIndex="10">
+            <Border CornerRadius="18" Background="{DynamicResource CardBackgroundBrush}" Padding="20" MaxWidth="520" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="24">
+                <StackPanel>
+                    <TextBlock Text="Downloading components..." FontSize="16" FontWeight="Bold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                    <TextBlock Text="{Binding DependencyDownloadStatus}" Margin="0,8,0,0" TextWrapping="Wrap"
+                               Foreground="{DynamicResource TertiaryTextBrush}" FontSize="12"/>
+                    <ProgressBar Minimum="0" Maximum="1" Height="8" Margin="0,12,0,0"
+                                 Value="{Binding DependencyDownloadProgress, Mode=OneWay}" Background="#e5e9f2" Foreground="#45c993" BorderThickness="0"/>
+                </StackPanel>
             </Border>
         </Grid>
     </Grid>

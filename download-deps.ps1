@@ -1,13 +1,23 @@
-﻿$ErrorActionPreference = "Stop"
+﻿param(
+    [string]$TorVersion = $env:ONIONHOP_TOR_VERSION
+)
+
+$ErrorActionPreference = "Stop"
 
 # Ensure TLS 1.2+ is used
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
 # Configuration
-$TorVersion = "14.0.4"
-$TorUrl = "https://archive.torproject.org/tor-package-archive/torbrowser/$TorVersion/tor-expert-bundle-windows-x86_64-$TorVersion.tar.gz"
+if ([string]::IsNullOrWhiteSpace($TorVersion)) {
+    $TorVersion = "latest"
+}
+$TorFallbackVersion = "14.0.4"
+$TorBaseUrl = "https://dist.torproject.org/torbrowser"
+$TorArchiveBaseUrl = "https://archive.torproject.org/tor-package-archive/torbrowser"
 $SingBoxApiUrl = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
 $WintunUrl = "https://www.wintun.net/builds/wintun-0.14.1.zip"
+# Known SHA256 checksum for Wintun 0.14.1
+$WintunExpectedHash = "07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51"
 $WebTunnelVersion = "v0.0.3"
 $WebTunnelSourceUrl = "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/archive/$WebTunnelVersion/webtunnel-$WebTunnelVersion.tar.gz"
 
@@ -21,6 +31,42 @@ $TempDir = Join-Path $RepoRoot "temp_deps"
 function Ensure-Dir($path) {
     if (-not (Test-Path $path)) {
         New-Item -ItemType Directory -Path $path -Force | Out-Null
+    }
+}
+
+# Helper to resolve latest Tor version with fallback
+function Get-LatestTorVersion($baseUrl, $fallbackVersion) {
+    try {
+        $index = Invoke-WebRequest -Uri $baseUrl
+        $versions = [regex]::Matches($index.Content, 'href="(?<ver>\d+\.\d+(\.\d+)*)/"') |
+            ForEach-Object { $_.Groups["ver"].Value } |
+            Sort-Object { [Version]$_ } -Descending
+        if ($versions.Count -gt 0) {
+            return $versions[0]
+        }
+        Write-Warning "No Tor versions found at $baseUrl. Falling back to $fallbackVersion."
+    } catch {
+        Write-Warning "Failed to query Tor versions from ${baseUrl}: $($_.Exception.Message). Falling back to $fallbackVersion."
+    }
+    return $fallbackVersion
+}
+
+# Helper to verify file checksum (SHA256)
+function Verify-FileHash($filePath, $expectedHash) {
+    if ([string]::IsNullOrWhiteSpace($expectedHash)) {
+        Write-Warning "No checksum provided for verification. Skipping..."
+        return $true
+    }
+    
+    $actualHash = (Get-FileHash -Path $filePath -Algorithm SHA256).Hash
+    if ($actualHash -eq $expectedHash) {
+        Write-Host "  Checksum verified: $actualHash" -ForegroundColor Green
+        return $true
+    } else {
+        Write-Warning "Checksum mismatch!"
+        Write-Warning "  Expected: $expectedHash"
+        Write-Warning "  Actual:   $actualHash"
+        return $false
     }
 }
 
@@ -43,14 +89,28 @@ try {
     Ensure-Dir $VpnDir
     Ensure-Dir $PtDir
 
+    if ($TorVersion -eq "latest") {
+        $TorVersion = Get-LatestTorVersion -baseUrl $TorBaseUrl -fallbackVersion $TorFallbackVersion
+    }
+    $TorUrl = "$TorBaseUrl/$TorVersion/tor-expert-bundle-windows-x86_64-$TorVersion.tar.gz"
+    $TorArchiveUrl = "$TorArchiveBaseUrl/$TorVersion/tor-expert-bundle-windows-x86_64-$TorVersion.tar.gz"
+
     # --- 1. Tor Expert Bundle ---
     Write-Host "`n[1/4] Downloading Tor Expert Bundle ($TorVersion)..."
     $TorArchive = Join-Path $TempDir "tor.tar.gz"
-    try {
-        Invoke-WebRequest -Uri $TorUrl -OutFile $TorArchive
-    } catch {
-        Write-Error "Failed to download Tor. Check the version URL."
-        throw $_
+    $TorDownloaded = $false
+    foreach ($candidate in @($TorUrl, $TorArchiveUrl)) {
+        try {
+            Invoke-WebRequest -Uri $candidate -OutFile $TorArchive
+            $TorDownloaded = $true
+            break
+        } catch {
+            if (Test-Path $TorArchive) { Remove-Item $TorArchive -Force }
+            Write-Warning "Failed to download Tor from ${candidate}: $($_.Exception.Message)"
+        }
+    }
+    if (-not $TorDownloaded) {
+        throw "Failed to download Tor from known URLs."
     }
 
     Write-Host "Extracting Tor..."
@@ -164,26 +224,57 @@ try {
         Write-Host "Updated pt_config.json for webtunnel-client."
     }
 
-    # --- 3. Sing-box ---
-    Write-Host "`n[3/4] Fetching Sing-box..."
+    # --- 3 & 4. Sing-box and Wintun (parallel download) ---
+    Write-Host "`n[3-4/4] Downloading Sing-box and Wintun in parallel..."
+    
+    # Get sing-box URL first (API call)
     $SbRelease = Invoke-RestMethod -Uri $SingBoxApiUrl
     $SbAsset = $SbRelease.assets | Where-Object { $_.name -like "*windows-amd64.zip" } | Select-Object -First 1
     if (-not $SbAsset) { throw "No windows-amd64 asset found." }
-    
     $SbUrl = $SbAsset.browser_download_url
-    Write-Host "Downloading $($SbAsset.name)..."
-    $SbArchive = Join-Path $TempDir "sing-box.zip"
-    Invoke-WebRequest -Uri $SbUrl -OutFile $SbArchive
     
+    $SbArchive = Join-Path $TempDir "sing-box.zip"
+    $WintunArchive = Join-Path $TempDir "wintun.zip"
+    
+    # Download both files in parallel using background jobs
+    Write-Host "  Starting parallel downloads..."
+    $downloadJobs = @(
+        Start-Job -ScriptBlock {
+            param($url, $outFile)
+            Invoke-WebRequest -Uri $url -OutFile $outFile
+        } -ArgumentList $SbUrl, $SbArchive
+        
+        Start-Job -ScriptBlock {
+            param($url, $outFile)
+            Invoke-WebRequest -Uri $url -OutFile $outFile
+        } -ArgumentList $WintunUrl, $WintunArchive
+    )
+    
+    Write-Host "  Waiting for downloads to complete..."
+    $downloadJobs | Wait-Job | Out-Null
+    
+    # Check for errors
+    foreach ($job in $downloadJobs) {
+        if ($job.State -eq "Failed") {
+            $errorMsg = $job | Receive-Job -ErrorAction SilentlyContinue
+            $downloadJobs | Remove-Job -Force
+            throw "Download failed: $errorMsg"
+        }
+    }
+    $downloadJobs | Remove-Job -Force
+    Write-Host "  Downloads completed." -ForegroundColor Green
+    
+    # Verify Wintun checksum
+    Write-Host "Verifying Wintun checksum..."
+    if (-not (Verify-FileHash -filePath $WintunArchive -expectedHash $WintunExpectedHash)) {
+        throw "Wintun download failed checksum verification. The file may be corrupted or tampered with."
+    }
+    
+    # Extract both archives
     Write-Host "Extracting Sing-box..."
     Expand-Archive -Path $SbArchive -DestinationPath $TempDir -Force
     $SbExtractedDir = Get-ChildItem -Path $TempDir -Directory | Where-Object { $_.Name -like "sing-box-*" } | Select-Object -First 1
     Copy-Item (Join-Path $SbExtractedDir.FullName "sing-box.exe") $VpnDir -Force
-
-    # --- 4. Wintun ---
-    Write-Host "`n[4/4] Downloading Wintun..."
-    $WintunArchive = Join-Path $TempDir "wintun.zip"
-    Invoke-WebRequest -Uri $WintunUrl -OutFile $WintunArchive
     
     Write-Host "Extracting Wintun..."
     Expand-Archive -Path $WintunArchive -DestinationPath (Join-Path $TempDir "wintun") -Force
