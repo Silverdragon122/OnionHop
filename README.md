@@ -1,11 +1,11 @@
-﻿# OnionHop
+# OnionHop
 
 <div align="center">
   <img src="logo.png" alt="OnionHop Logo" width="200"/>
 </div>
 
 <div align="center">
-  <img src="screenshot.png" alt="OnionHop UI Screenshot" width="800"/>
+  <img src="assets/onionhop-ui.png" alt="OnionHop UI Screenshot" width="800"/>
 </div>
 
 <div align="center">
@@ -256,4 +256,4 @@ GPLv3. See `LICENSE`.
 
 For support, please either:
 - Open an issue on this repository
-- Join the Discord server: https://discord.gg/sNsJzKBNUG
+- Join the Discord server: https://discord.gg/y3MVspPzKQ
