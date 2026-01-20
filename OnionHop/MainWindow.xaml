@@ -168,7 +168,8 @@
                                           Background="{TemplateBinding Background}"
                                           BorderBrush="{TemplateBinding BorderBrush}"
                                           BorderThickness="{TemplateBinding BorderThickness}"
-                                          Padding="{TemplateBinding Padding}">
+                                          Padding="{TemplateBinding Padding}"
+                                          Foreground="{TemplateBinding Foreground}">
                                 <ToggleButton.Template>
                                     <ControlTemplate TargetType="ToggleButton">
                                         <Border x:Name="Bd"
@@ -178,11 +179,11 @@
                                                 CornerRadius="12"
                                                 Padding="{TemplateBinding Padding}">
                                             <Grid>
-                                                <ContentPresenter Margin="0"
-                                                                  HorizontalAlignment="Left"
-                                                                  VerticalAlignment="Center"
-                                                                  TextElement.Foreground="{TemplateBinding Foreground}"
-                                                                  Content="{Binding SelectionBoxItem, RelativeSource={RelativeSource AncestorType=ComboBox}}"/>
+                                                <TextBlock Margin="0"
+                                                           HorizontalAlignment="Left"
+                                                           VerticalAlignment="Center"
+                                                           Text="{Binding SelectionBoxItem, RelativeSource={RelativeSource AncestorType=ComboBox}}"
+                                                           Foreground="{TemplateBinding Foreground}"/>
                                                 <Path x:Name="Arrow"
                                                       HorizontalAlignment="Right"
                                                       VerticalAlignment="Center"
@@ -227,6 +228,27 @@
                         <Setter Property="HorizontalContentAlignment" Value="Left"/>
                         <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
                         <Setter Property="Foreground" Value="{Binding RelativeSource={RelativeSource AncestorType=ComboBox}, Path=Foreground}"/>
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="ComboBoxItem">
+                                    <Border Background="{TemplateBinding Background}" 
+                                            BorderThickness="0"
+                                            Padding="{TemplateBinding Padding}">
+                                        <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                                          VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                                          TextElement.Foreground="{TemplateBinding Foreground}"/>
+                                    </Border>
+                                    <ControlTemplate.Triggers>
+                                        <Trigger Property="IsMouseOver" Value="True">
+                                            <Setter Property="Background" Value="{DynamicResource ComboItemHoverBrush}"/>
+                                        </Trigger>
+                                        <Trigger Property="IsSelected" Value="True">
+                                            <Setter Property="Background" Value="{DynamicResource ComboItemSelectedBrush}"/>
+                                        </Trigger>
+                                    </ControlTemplate.Triggers>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
                         <Style.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
                                 <Setter Property="Background" Value="{DynamicResource ComboItemHoverBrush}"/>
@@ -243,7 +265,7 @@
         <Style x:Key="DarkCombo" TargetType="ComboBox" BasedOn="{StaticResource ComboBase}">
             <Setter Property="Background" Value="#24306b"/>
             <Setter Property="BorderBrush" Value="#3f4c85"/>
-            <Setter Property="Foreground" Value="#e9f1ff"/>
+            <Setter Property="Foreground" Value="White"/>
             <Setter Property="Padding" Value="12,8"/>
         </Style>
         <Style x:Key="LightCombo" TargetType="ComboBox" BasedOn="{StaticResource ComboBase}">
@@ -453,6 +475,7 @@
                                                               ItemsSource="{Binding ConnectionModes}"
                                                               SelectedItem="{Binding SelectedConnectionMode}"
                                                               Style="{DynamicResource HeroComboStyle}"
+                                                              Foreground="{DynamicResource HeroCardValueBrush}"
                                                               MaxDropDownHeight="220"/>
                                                     <TextBlock Text="TUN/VPN requires Administrator." Foreground="{DynamicResource HeroCardSecondaryTextBrush}" FontSize="12" Margin="0,8,0,0"/>
                                                 </StackPanel>
@@ -481,6 +504,7 @@
                                                                   ItemsSource="{Binding Locations}"
                                                                   SelectedItem="{Binding SelectedLocation}"
                                                                   Style="{DynamicResource HeroComboStyle}"
+                                                                  Foreground="{DynamicResource HeroCardValueBrush}"
                                                                   MaxDropDownHeight="200"/>
                                                     </StackPanel>
                                                 </Border>
@@ -649,7 +673,13 @@
                                             <TextBlock Text="{Binding AboutReleaseDateText}" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" Margin="0,4,0,0"/>
                                         </StackPanel>
                                     </Border>
-                                    <TextBlock Text="{Binding AboutText}" Margin="0,10,0,0" TextWrapping="Wrap" Foreground="{DynamicResource PrimaryTextBrush}" FontSize="13"/>
+                                    <Button Style="{StaticResource SegmentedButton}" Margin="0,14,0,0" HorizontalAlignment="Left" Click="DiscordButton_Click">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock Text="💬" FontSize="16" Margin="0,0,8,0" VerticalAlignment="Center"/>
+                                            <TextBlock Text="Join Discord" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}" VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Button>
+                                    <TextBlock Text="{Binding AboutText}" Margin="0,14,0,0" TextWrapping="Wrap" Foreground="{DynamicResource PrimaryTextBrush}" FontSize="13"/>
                                 </StackPanel>
                             </ScrollViewer>
                         </Border>
@@ -674,6 +704,7 @@
                                                   Width="190"
                                                   ItemsSource="{Binding AutoStartModes}"
                                                   SelectedItem="{Binding AutoStartMode}"
+                                                  Foreground="{DynamicResource PrimaryTextBrush}"
                                                   Style="{StaticResource LightCombo}"/>
                                         <StackPanel DockPanel.Dock="Left">
                                             <TextBlock Text="Start with Windows" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
@@ -751,6 +782,7 @@
                                             <ComboBox Margin="0,6,0,0"
                                                       ItemsSource="{Binding BridgeTypes}"
                                                       SelectedItem="{Binding SelectedBridgeType}"
+                                                      Foreground="{DynamicResource PrimaryTextBrush}"
                                                       Style="{StaticResource LightCombo}"
                                                       MaxDropDownHeight="200"/>
                                             <TextBlock Text="Webtunnel uses webtunnel-client.exe. OnionHop will try to refresh built-in webtunnel bridges automatically, or you can paste your own."

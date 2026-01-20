@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
@@ -2491,6 +2491,19 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
+    private void DiscordButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo("https://discord.gg/y3MVspPzKQ") { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = $"Failed to open Discord: {ex.Message}";
+            AppendLog($"Discord link failed: {ex.Message}");
+        }
+    }
+
     private async Task StartSingBoxVpnAsync(CancellationToken token)
     {
         StopSingBoxProcess(allowElevation: false);
@@ -3783,10 +3796,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void Window_StateChanged(object? sender, EventArgs e)
     {
         UpdateMaximizeGlyph();
-        if (WindowState == WindowState.Minimized && MinimizeToTray && !_isExiting)
-        {
-            HideToTray();
-        }
     }
 
     private void ToggleWindowState()
