@@ -1,5 +1,6 @@
 ﻿param(
-    [string]$TorVersion = $env:ONIONHOP_TOR_VERSION
+    [string]$TorVersion = $env:ONIONHOP_TOR_VERSION,
+    [switch]$NoPause
 )
 
 $ErrorActionPreference = "Stop"
@@ -72,7 +73,7 @@ function Verify-FileHash($filePath, $expectedHash) {
 
 # Helper to pause on exit
 function Exit-WithPause($code) {
-    if ($Host.Name -eq "ConsoleHost") {
+    if (-not $NoPause -and $Host.Name -eq "ConsoleHost") {
         Write-Host "`nPress any key to exit..."
         $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     }
