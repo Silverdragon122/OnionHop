@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Buffers.Binary;
 using System.Formats.Tar;
 using System.IO;
 using System.IO.Compression;
@@ -18,12 +19,15 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Xml.Linq;
 using System.Windows;
 using System.Windows.Media.Effects;
 using System.Windows.Media;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Shell;
+using System.Windows.Threading;
+using System.Diagnostics.Eventing.Reader;
 using Microsoft.Win32;
 using Brush = System.Windows.Media.Brush;
 using Color = System.Windows.Media.Color;
@@ -39,6 +43,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 {
     private static readonly Regex AnsiEscapeRegex = new(@"\x1B\[[0-?]*[ -/]*[@-~]", RegexOptions.Compiled);
     private static readonly Regex SingBoxConnectionToRegex = new(@"connection to (?<dest>\S+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex BridgeFrontsRegex = new(@"\bfronts=(?<value>[^\s]+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex BridgeFrontRegex = new(@"\bfront=(?<value>[^\s]+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex BridgeSniRegex = new(@"\bsni=(?<value>[^\s]+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     private static readonly string[] BrowserProcessNames =
     {
@@ -71,14 +78,32 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private const string SingBoxApiUrl = "https://api.github.com/repos/SagerNet/sing-box/releases/latest";
     private const string WintunUrl = "https://www.wintun.net/builds/wintun-0.14.1.zip";
     private const string WebTunnelBridgeSourceUrl = "https://bridges.torproject.org/bridges?transport=webtunnel&format=plain";
+
+    private const string DnsProviderCloudflare = "Cloudflare (DoH)";
+    private const string DnsProviderGoogle = "Google (DoH)";
+    private const string DnsProviderQuad9 = "Quad9 (DoH)";
+    private const string DnsProviderCustom = "Custom (DoH)";
     private static readonly TimeSpan TorExitCooldown = TimeSpan.FromSeconds(5);
 
     private bool _isConnecting;
     private bool _isConnected;
+    private bool _cancelConnectRequested;
+    private bool _torStopRequested;
+    private bool _snowflakeBrokerFailureSeen;
+    private bool _snowflakeNoProxiesSeen;
+    private bool _autoFallbackToWebTunnelUsed;
     private string _selectedLocation = AutomaticLocationLabel;
     private string _statusMessage = "Ready to route traffic through Tor.";
     private string _connectionStatus = "Disconnected";
     private string _currentIp = "--.--.--.--";
+    private int _ipLookupSequence;
+    private int _ipRefreshInFlight;
+    private DispatcherTimer? _ipRefreshTimer;
+    private DispatcherTimer? _dnsClientPollTimer;
+    private int _dnsClientPollInFlight;
+    private long _lastDnsClientRecordId;
+    private bool _dnsClientWatcherAttempted;
+    private bool _dnsClientLogNeedsEnable;
     private Brush _statusBrush = new SolidColorBrush(Color.FromRgb(209, 67, 75));
     private double _connectionProgress;
     private bool _dependencyDownloadInProgress;
@@ -109,11 +134,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private readonly MainViewModel _viewModel = new();
     public ObservableCollection<string> LogLines => _viewModel.LogLines;
+    public ObservableCollection<string> DnsLogLines => _viewModel.DnsLogLines;
 
     private readonly object _logLock = new();
+    private readonly object _dnsLogLock = new();
     private bool _showLogs;
     private bool _showAbout;
     private bool _showSettings;
+    private bool _showDnsLogs;
 
     private string? _previousProxy;
     private int? _previousProxyEnabled;
@@ -164,6 +192,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     public ObservableCollection<string> BridgeTypes { get; } = new();
 
+    public ObservableCollection<string> DnsProviders { get; } = new()
+    {
+        DnsProviderCloudflare,
+        DnsProviderGoogle,
+        DnsProviderQuad9,
+        DnsProviderCustom
+    };
+
     public string SelectedLocation
     {
         get => _selectedLocation;
@@ -180,6 +216,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         if (_isDisconnecting)
         {
+            return;
+        }
+
+        if (_torStopRequested)
+        {
+            _torStopRequested = false;
             return;
         }
 
@@ -371,6 +413,55 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     }
     private string _customBridges = string.Empty;
 
+    public string CustomSniHosts
+    {
+        get => _customSniHosts;
+        set
+        {
+            if (SetField(ref _customSniHosts, value))
+            {
+                NotifyBridgeSettingsChanged();
+            }
+        }
+    }
+    private string _customSniHosts = string.Empty;
+
+    public string SelectedDnsProvider
+    {
+        get => _selectedDnsProvider;
+        set
+        {
+            if (SetField(ref _selectedDnsProvider, value))
+            {
+                Raise(nameof(IsCustomDnsProvider));
+            }
+        }
+    }
+    private string _selectedDnsProvider = DnsProviderCloudflare;
+
+    public bool IsCustomDnsProvider => string.Equals(SelectedDnsProvider, DnsProviderCustom, StringComparison.OrdinalIgnoreCase);
+
+    public string CustomDohHost
+    {
+        get => _customDohHost;
+        set => SetField(ref _customDohHost, value);
+    }
+    private string _customDohHost = string.Empty;
+
+    public string CustomDohPath
+    {
+        get => _customDohPath;
+        set => SetField(ref _customDohPath, value);
+    }
+    private string _customDohPath = "/dns-query";
+
+    public string DnsTestStatus
+    {
+        get => _dnsTestStatus;
+        private set => SetField(ref _dnsTestStatus, value);
+    }
+    private string _dnsTestStatus = string.Empty;
+
     public bool IsDarkMode
     {
         get => _isDarkMode;
@@ -395,6 +486,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 {
                     ShowAbout = false;
                     ShowSettings = false;
+                    ShowDnsLogs = false;
                 }
                 Raise(nameof(IsOverlayVisible));
             }
@@ -412,6 +504,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 {
                     ShowLogs = false;
                     ShowSettings = false;
+                    ShowDnsLogs = false;
                 }
                 Raise(nameof(IsOverlayVisible));
             }
@@ -429,13 +522,33 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 {
                     ShowLogs = false;
                     ShowAbout = false;
+                    ShowDnsLogs = false;
                 }
                 Raise(nameof(IsOverlayVisible));
             }
         }
     }
 
-    public bool IsOverlayVisible => ShowLogs || ShowAbout || ShowSettings;
+    public bool ShowDnsLogs
+    {
+        get => _showDnsLogs;
+        set
+        {
+            if (SetField(ref _showDnsLogs, value))
+            {
+                if (value)
+                {
+                    ShowLogs = false;
+                    ShowAbout = false;
+                    ShowSettings = false;
+                }
+
+                Raise(nameof(IsOverlayVisible));
+            }
+        }
+    }
+
+    public bool IsOverlayVisible => ShowLogs || ShowAbout || ShowSettings || ShowDnsLogs;
 
     public string AboutVersionText
     {
@@ -550,6 +663,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         set => SetField(ref _currentIp, value);
     }
 
+    public bool DnsClientLogNeedsEnable
+    {
+        get => _dnsClientLogNeedsEnable;
+        private set => SetField(ref _dnsClientLogNeedsEnable, value);
+    }
+
     public double ConnectionProgress
     {
         get => _connectionProgress;
@@ -577,9 +696,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public string ConnectButtonText
         => _isConnected ? "Disconnect"
             : _isDisconnecting ? "Disconnecting..."
-            : _isConnecting ? "Connecting..."
+            : _isConnecting ? (_cancelConnectRequested ? "Canceling..." : "Cancel")
             : "Connect";
     private bool _isDisconnecting;
+
+    public bool IsConnectionBusy => _isConnecting || _isDisconnecting;
 
     public bool CanChangeIdentity => _isConnected && !_isConnecting;
 
@@ -618,6 +739,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         LoadBridgeConfig();
         LoadUserSettings();
         ApplyStartupArguments(Environment.GetCommandLineArgs());
+        StartIpRefreshTimer();
+        StartDnsClientPolling();
         PrepareStartupVisibility();
         ApplyTheme(IsDarkMode);
         UpdateAboutMetadata();
@@ -638,6 +761,335 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         StartupLogger.Write("MainWindow ctor complete.");
     }
+
+    private void StartIpRefreshTimer()
+    {
+        if (_ipRefreshTimer != null)
+        {
+            return;
+        }
+
+        _ipRefreshTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher)
+        {
+            Interval = TimeSpan.FromSeconds(30)
+        };
+        _ipRefreshTimer.Tick += async (_, _) =>
+        {
+            if (_isConnecting || _isDisconnecting || IsDependencyDownloadInProgress)
+            {
+                return;
+            }
+
+            _ipRefreshTimer.Interval = _isConnected ? TimeSpan.FromSeconds(10) : TimeSpan.FromSeconds(30);
+
+            if (Interlocked.Exchange(ref _ipRefreshInFlight, 1) == 1)
+            {
+                return;
+            }
+
+            try
+            {
+                await UpdateCurrentIpAsync(updateStatusMessage: false);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _ipRefreshInFlight, 0);
+            }
+        };
+        _ipRefreshTimer.Start();
+    }
+
+    private void StartDnsClientPolling()
+    {
+        if (_dnsClientWatcherAttempted)
+        {
+            return;
+        }
+
+        _dnsClientWatcherAttempted = true;
+        try
+        {
+            // Windows DNS Client operational log can provide useful real-time DNS visibility even in Proxy Mode.
+            // This log is sometimes disabled on a system; in that case we just no-op.
+            const string logName = "Microsoft-Windows-DNS-Client/Operational";
+
+            try
+            {
+                using var config = new EventLogConfiguration(logName);
+                if (!config.IsEnabled)
+                {
+                    DnsClientLogNeedsEnable = true;
+                    AppendDnsLog("dns-client: Operational log is disabled. Click 'Enable DNS Client Log' or enable it in Event Viewer (DNS Client Events > Operational).");
+                    return;
+                }
+
+                DnsClientLogNeedsEnable = false;
+            }
+            catch (Exception ex)
+            {
+                AppendDnsLog($"dns-client: unable to read log configuration ({ex.Message}).");
+                return;
+            }
+
+            if (_dnsClientPollTimer != null)
+            {
+                return;
+            }
+
+            _dnsClientPollTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher)
+            {
+                Interval = TimeSpan.FromSeconds(10)
+            };
+            _dnsClientPollTimer.Tick += async (_, _) =>
+            {
+                _dnsClientPollTimer.Interval = ShowDnsLogs ? TimeSpan.FromSeconds(3) : TimeSpan.FromSeconds(10);
+
+                if (Interlocked.Exchange(ref _dnsClientPollInFlight, 1) == 1)
+                {
+                    return;
+                }
+
+                try
+                {
+                    await PollDnsClientLogAsync().ConfigureAwait(false);
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _dnsClientPollInFlight, 0);
+                }
+            };
+            _dnsClientPollTimer.Start();
+            AppendDnsLog("dns-client: polling enabled.");
+        }
+        catch (Exception ex)
+        {
+            AppendDnsLog($"dns-client: watcher unavailable ({ex.Message}).");
+        }
+    }
+
+    private async Task PollDnsClientLogAsync()
+    {
+        const string logName = "Microsoft-Windows-DNS-Client/Operational";
+
+        try
+        {
+            using var config = new EventLogConfiguration(logName);
+            if (!config.IsEnabled)
+            {
+                DnsClientLogNeedsEnable = true;
+                return;
+            }
+        }
+        catch
+        {
+            return;
+        }
+
+        DnsClientLogNeedsEnable = false;
+
+        var xml = await RunWevtutilQueryAsync().ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(xml))
+        {
+            return;
+        }
+
+        List<(long RecordId, string Message)> parsed;
+        try
+        {
+            parsed = ParseDnsClientEvents(xml);
+        }
+        catch
+        {
+            return;
+        }
+
+        if (parsed.Count == 0)
+        {
+            return;
+        }
+
+        var newItems = parsed
+            .Where(item => item.RecordId > Interlocked.Read(ref _lastDnsClientRecordId))
+            .OrderBy(item => item.RecordId)
+            .ToList();
+
+        if (newItems.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var item in newItems)
+        {
+            AppendDnsLog(item.Message);
+        }
+
+        Interlocked.Exchange(ref _lastDnsClientRecordId, Math.Max(_lastDnsClientRecordId, newItems.Max(i => i.RecordId)));
+    }
+
+    private static async Task<string?> RunWevtutilQueryAsync()
+    {
+        // Query a handful of newest DNS client events (XML) and parse RecordId + fields ourselves.
+        // This avoids EventLogWatcher issues on some systems.
+        const string logName = "Microsoft-Windows-DNS-Client/Operational";
+        const string query = "*[System[(EventID=3006 or EventID=3008 or EventID=3010 or EventID=3020)]]";
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = "wevtutil",
+            Arguments = $"qe \"{logName}\" /q:\"{query}\" /rd:true /c:20 /f:xml",
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+
+        using var proc = Process.Start(psi);
+        if (proc == null)
+        {
+            return null;
+        }
+
+        var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+        var stderrTask = proc.StandardError.ReadToEndAsync();
+
+        await proc.WaitForExitAsync().ConfigureAwait(false);
+        var stdout = await stdoutTask.ConfigureAwait(false);
+        var stderr = await stderrTask.ConfigureAwait(false);
+
+        if (proc.ExitCode != 0)
+        {
+            // If the log exists but no events yet, wevtutil can still return non-zero.
+            // Treat as no output rather than spamming DNS log.
+            _ = stderr;
+            return null;
+        }
+
+        return stdout;
+    }
+
+    private static List<(long RecordId, string Message)> ParseDnsClientEvents(string xml)
+    {
+        var results = new List<(long, string)>();
+        var doc = XDocument.Parse(xml);
+
+        // wevtutil output wraps multiple events in <Events>.
+        var events = doc.Descendants().Where(e => e.Name.LocalName == "Event").ToList();
+        if (events.Count == 0 && doc.Root?.Name.LocalName == "Event")
+        {
+            events.Add(doc.Root);
+        }
+
+        XNamespace ns = "http://schemas.microsoft.com/win/2004/08/events/event";
+        foreach (var ev in events)
+        {
+            var system = ev.Element(ns + "System");
+            var recordIdText = system?.Element(ns + "EventRecordID")?.Value;
+            if (!long.TryParse(recordIdText, out var recordId))
+            {
+                continue;
+            }
+
+            string? queryName = null;
+            string? queryType = null;
+            string? status = null;
+
+            foreach (var data in ev.Descendants(ns + "Data"))
+            {
+                var nameAttr = data.Attribute("Name")?.Value;
+                var value = data.Value?.Trim();
+                if (string.IsNullOrWhiteSpace(nameAttr) || string.IsNullOrWhiteSpace(value))
+                {
+                    continue;
+                }
+
+                if (nameAttr.Equals("QueryName", StringComparison.OrdinalIgnoreCase))
+                {
+                    queryName = value;
+                }
+                else if (nameAttr.Equals("QueryType", StringComparison.OrdinalIgnoreCase))
+                {
+                    queryType = value;
+                }
+                else if (nameAttr.Equals("QueryStatus", StringComparison.OrdinalIgnoreCase)
+                         || nameAttr.Equals("Status", StringComparison.OrdinalIgnoreCase))
+                {
+                    status = value;
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(queryName))
+            {
+                continue;
+            }
+
+            var parts = new List<string> { "dns-client:", queryName };
+            if (!string.IsNullOrWhiteSpace(queryType))
+            {
+                parts.Add($"type={queryType}");
+            }
+            if (!string.IsNullOrWhiteSpace(status))
+            {
+                parts.Add($"status={status}");
+            }
+
+            results.Add((recordId, string.Join(' ', parts)));
+        }
+
+        return results;
+    }
+
+    private async void EnableDnsClientLog_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            StatusMessage = "Enabling Windows DNS Client log (admin prompt may appear)...";
+            AppendDnsLog("dns-client: enabling Operational log...");
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = "wevtutil",
+                Arguments = "sl \"Microsoft-Windows-DNS-Client/Operational\" /e:true",
+                UseShellExecute = true,
+                Verb = "runas",
+                CreateNoWindow = true
+            };
+
+            using var proc = Process.Start(psi);
+            if (proc == null)
+            {
+                AppendDnsLog("dns-client: failed to start wevtutil.");
+                StatusMessage = "Unable to enable DNS Client log.";
+                return;
+            }
+
+            await proc.WaitForExitAsync();
+            if (proc.ExitCode != 0)
+            {
+                AppendDnsLog($"dns-client: wevtutil exited with code {proc.ExitCode}.");
+                StatusMessage = "Unable to enable DNS Client log (wevtutil failed).";
+                return;
+            }
+
+            AppendDnsLog("dns-client: enabled. Starting watcher...");
+            StatusMessage = "DNS Client log enabled.";
+
+            _dnsClientWatcherAttempted = false;
+            Interlocked.Exchange(ref _lastDnsClientRecordId, 0);
+            StartDnsClientPolling();
+        }
+        catch (Win32Exception ex) when (ex.NativeErrorCode == 1223)
+        {
+            // User canceled UAC prompt
+            AppendDnsLog("dns-client: enable canceled by user.");
+            StatusMessage = "Enable DNS Client log canceled.";
+        }
+        catch (Exception ex)
+        {
+            AppendDnsLog($"dns-client: enable failed ({ex.Message}).");
+            StatusMessage = $"Unable to enable DNS Client log: {ex.Message}";
+        }
+    }
+
 
     private void UpdateAboutMetadata()
     {
@@ -949,6 +1401,18 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
             CustomBridges = settings.CustomBridges ?? string.Empty;
             UseCensoredMode = settings.UseCensoredMode;
+            CustomSniHosts = settings.CustomSniHosts ?? string.Empty;
+
+            if (!string.IsNullOrWhiteSpace(settings.SelectedDnsProvider) && DnsProviders.Contains(settings.SelectedDnsProvider))
+            {
+                SelectedDnsProvider = settings.SelectedDnsProvider;
+            }
+
+            CustomDohHost = settings.CustomDohHost ?? string.Empty;
+            if (!string.IsNullOrWhiteSpace(settings.CustomDohPath))
+            {
+                CustomDohPath = settings.CustomDohPath;
+            }
         }
         catch (Exception ex)
         {
@@ -1030,7 +1494,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             UseTorBridges = UseTorBridges,
             UseCensoredMode = UseCensoredMode,
             SelectedBridgeType = SelectedBridgeType,
-            CustomBridges = CustomBridges
+            CustomBridges = CustomBridges,
+            CustomSniHosts = CustomSniHosts,
+            SelectedDnsProvider = SelectedDnsProvider,
+            CustomDohHost = CustomDohHost,
+            CustomDohPath = CustomDohPath
         };
 
         _settingsService.Save(settings);
@@ -1547,6 +2015,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     protected override async void OnContentRendered(EventArgs e)
     {
         base.OnContentRendered(e);
+        CurrentIp = "Resolving...";
+        _ = UpdateCurrentIpAsync(updateStatusMessage: false);
         if (_startMinimizedOnLaunch)
         {
             if (MinimizeToTray)
@@ -1929,6 +2399,15 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 updated = true;
             }
 
+            var desiredSnowflake = "ClientTransportPlugin snowflake exec ${pt_path}snowflake-client.exe";
+            if (!config.PluggableTransports.TryGetValue("snowflake", out var snowflakePlugin)
+                || string.IsNullOrWhiteSpace(snowflakePlugin)
+                || !snowflakePlugin.Contains("snowflake-client.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                config.PluggableTransports["snowflake"] = desiredSnowflake;
+                updated = true;
+            }
+
             if (!config.PluggableTransports.ContainsKey("webtunnel"))
             {
                 config.PluggableTransports["webtunnel"] =
@@ -2076,6 +2555,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         if (_isConnecting)
         {
+            RequestCancelConnect();
             return;
         }
 
@@ -2100,15 +2580,189 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
-    private async void RefreshIpButton_Click(object sender, RoutedEventArgs e)
+    private void RequestCancelConnect()
     {
-        if (!_isConnected)
+        if (!_isConnecting)
         {
-            StatusMessage = "Connect first to refresh the exit IP.";
             return;
         }
 
-        await UpdateCurrentIpAsync();
+        if (_cancelConnectRequested)
+        {
+            return;
+        }
+
+        _cancelConnectRequested = true;
+        Raise(nameof(ConnectButtonText));
+        Raise(nameof(IsConnectionBusy));
+        UpdateConnectVisualState();
+        ConnectionStatus = "Canceling...";
+        StatusMessage = "Canceling connection attempt...";
+
+        try
+        {
+            _connectCts?.Cancel();
+        }
+        catch
+        {
+        }
+    }
+
+    private async void TestDnsButton_Click(object sender, RoutedEventArgs e)
+    {
+        var doh = ResolveDohSettings();
+
+        try
+        {
+            var query = BuildDnsQuery("example.com");
+            var dnsParam = Base64UrlEncode(query);
+            DnsTestStatus = $"Testing {doh.Server}...";
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var sw = Stopwatch.StartNew();
+            using var response = await SendDohTestAsync(doh, query, dnsParam, cts.Token);
+            sw.Stop();
+
+            DnsTestStatus = response.IsSuccessStatusCode
+                ? $"DoH {doh.Server}: {sw.ElapsedMilliseconds} ms."
+                : $"DoH {doh.Server}: {sw.ElapsedMilliseconds} ms (HTTP {(int)response.StatusCode}).";
+        }
+        catch (OperationCanceledException)
+        {
+            DnsTestStatus = "DNS test timed out.";
+        }
+        catch (Exception ex)
+        {
+            DnsTestStatus = $"DNS test failed: {ex.Message}";
+        }
+    }
+
+    private static async Task<HttpResponseMessage> SendDohTestAsync(DohSettings doh, byte[] query, string dnsParam, CancellationToken token)
+    {
+        var uri = BuildDohTestUri(doh, dnsParam);
+
+        using var getRequest = new HttpRequestMessage(HttpMethod.Get, uri);
+        ConfigureDohRequestHeaders(getRequest);
+        var getResponse = await HttpClientFactory.Default.SendAsync(getRequest, HttpCompletionOption.ResponseHeadersRead, token)
+            .ConfigureAwait(false);
+        if (getResponse.IsSuccessStatusCode)
+        {
+            return getResponse;
+        }
+
+        if (getResponse.StatusCode != HttpStatusCode.BadRequest && getResponse.StatusCode != HttpStatusCode.MethodNotAllowed)
+        {
+            return getResponse;
+        }
+
+        getResponse.Dispose();
+
+        var postUri = new UriBuilder("https", doh.Server, doh.Port, NormalizeDohPath(doh.Path)).Uri;
+        using var postRequest = new HttpRequestMessage(HttpMethod.Post, postUri)
+        {
+            Content = new ByteArrayContent(query)
+        };
+        ConfigureDohRequestHeaders(postRequest);
+        postRequest.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/dns-message");
+
+        return await HttpClientFactory.Default.SendAsync(postRequest, HttpCompletionOption.ResponseHeadersRead, token)
+            .ConfigureAwait(false);
+    }
+
+    private static void ConfigureDohRequestHeaders(HttpRequestMessage request)
+    {
+        request.Headers.Accept.Clear();
+        request.Headers.Accept.ParseAdd("application/dns-message");
+
+        // Some DoH providers require HTTP/2; request it but allow fallback if unavailable.
+        request.Version = HttpVersion.Version20;
+        request.VersionPolicy = HttpVersionPolicy.RequestVersionOrHigher;
+    }
+
+    private static Uri BuildDohTestUri(DohSettings doh, string dnsParam)
+    {
+        var path = doh.Path;
+        string? existingQuery = null;
+        var questionIndex = path.IndexOf('?', StringComparison.Ordinal);
+        if (questionIndex >= 0)
+        {
+            existingQuery = path[(questionIndex + 1)..];
+            path = path[..questionIndex];
+        }
+
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            path = "/dns-query";
+        }
+        else if (!path.StartsWith("/", StringComparison.Ordinal))
+        {
+            path = "/" + path;
+        }
+
+        var builder = new UriBuilder("https", doh.Server, doh.Port, path);
+        var dnsQuery = $"dns={Uri.EscapeDataString(dnsParam)}";
+
+        if (!string.IsNullOrWhiteSpace(existingQuery))
+        {
+            builder.Query = $"{existingQuery.TrimStart('?')}&{dnsQuery}";
+        }
+        else
+        {
+            builder.Query = dnsQuery;
+        }
+
+        return builder.Uri;
+    }
+
+    private static byte[] BuildDnsQuery(string host)
+    {
+        var name = (host ?? string.Empty).Trim().TrimEnd('.');
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            name = "example.com";
+        }
+
+        var labels = name.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (labels.Length == 0)
+        {
+            labels = new[] { "example", "com" };
+        }
+
+        using var ms = new MemoryStream(96);
+        Span<byte> header = stackalloc byte[12];
+        BinaryPrimitives.WriteUInt16BigEndian(header[..2], (ushort)Random.Shared.Next(0, ushort.MaxValue + 1));
+        BinaryPrimitives.WriteUInt16BigEndian(header.Slice(2, 2), 0x0100); // recursion desired
+        BinaryPrimitives.WriteUInt16BigEndian(header.Slice(4, 2), 1); // QDCOUNT
+        ms.Write(header);
+
+        foreach (var label in labels)
+        {
+            var bytes = Encoding.ASCII.GetBytes(label);
+            if (bytes.Length == 0 || bytes.Length > 63)
+            {
+                continue;
+            }
+
+            ms.WriteByte((byte)bytes.Length);
+            ms.Write(bytes);
+        }
+
+        ms.WriteByte(0); // QNAME terminator
+
+        Span<byte> question = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt16BigEndian(question[..2], 1); // QTYPE=A
+        BinaryPrimitives.WriteUInt16BigEndian(question.Slice(2, 2), 1); // QCLASS=IN
+        ms.Write(question);
+
+        return ms.ToArray();
+    }
+
+    private static string Base64UrlEncode(byte[] data)
+    {
+        return Convert.ToBase64String(data)
+            .TrimEnd('=')
+            .Replace('+', '-')
+            .Replace('/', '_');
     }
 
     private async void DisconnectButton_Click(object sender, RoutedEventArgs e)
@@ -2172,7 +2826,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         _lastConnectAttemptUtc = DateTime.UtcNow;
         _bridgeValidationMessage = null;
+        _cancelConnectRequested = false;
+        _torStopRequested = false;
+        _snowflakeBrokerFailureSeen = false;
+        _snowflakeNoProxiesSeen = false;
+        _autoFallbackToWebTunnelUsed = false;
         _isDisconnecting = false;
+        Raise(nameof(IsConnectionBusy));
         UpdateConnectVisualState();
         Raise(nameof(ConnectButtonText));
 
@@ -2185,9 +2845,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             return;
         }
 
-        _connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        var connectTimeout = UseTorBridges ? TimeSpan.FromSeconds(240) : TimeSpan.FromSeconds(60);
+        _connectCts = new CancellationTokenSource(connectTimeout);
         _isConnecting = true;
         Raise(nameof(ConnectButtonText));
+        Raise(nameof(IsConnectionBusy));
         UpdateConnectVisualState();
         ConnectionStatus = "Connecting...";
         StatusMessage = "Starting Tor and bootstrapping network...";
@@ -2239,19 +2901,34 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
         catch (OperationCanceledException)
         {
-            AppendLog("Connect timed out.");
+            AppendLog(_cancelConnectRequested ? "Connect canceled by user." : "Connect timed out.");
             StopSingBoxProcess(allowElevation: IsTunMode);
             if (IsTunMode && KillSwitchEnabled && !UseHybridRouting)
             {
                 _ = Task.Run(() => DisableKillSwitchEmergencyBlock());
             }
-            StatusMessage = "Tor connection timed out.";
+            if (_cancelConnectRequested)
+            {
+                StatusMessage = "Connection canceled.";
+            }
+            else if (TryScheduleWebTunnelFallbackRetry("Tor connection timed out. Retrying with WebTunnel bridges..."))
+            {
+                StatusMessage = "Tor connection timed out. Retrying with WebTunnel bridges...";
+            }
+            else if (_snowflakeBrokerFailureSeen)
+            {
+                StatusMessage = "Snowflake broker unreachable. Try a different bridge or custom SNI fronts.";
+            }
+            else
+            {
+                StatusMessage = "Tor connection timed out.";
+            }
             ConnectionStatus = "Disconnected";
             StatusBrush = new SolidColorBrush(Color.FromRgb(209, 67, 75));
             ConnectionProgress = 0;
             StopTorProcess();
 
-            if (ShouldAutoRetryConnect())
+            if (!_cancelConnectRequested && ShouldAutoRetryConnect())
             {
                 AppendLog("Initial connect timed out quickly; retrying once...");
                 StatusMessage = "Initial connect timed out. Retrying once...";
@@ -2266,7 +2943,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             {
                 _ = Task.Run(() => DisableKillSwitchEmergencyBlock());
             }
-            StatusMessage = $"Failed to connect: {ex.Message}";
+            if (TryScheduleWebTunnelFallbackRetry("Tor connection failed. Retrying with WebTunnel bridges..."))
+            {
+                StatusMessage = "Tor connection failed. Retrying with WebTunnel bridges...";
+            }
+            else
+            {
+                StatusMessage = $"Failed to connect: {ex.Message}";
+            }
             ConnectionStatus = "Disconnected";
             StatusBrush = new SolidColorBrush(Color.FromRgb(209, 67, 75));
             ConnectionProgress = 0;
@@ -2283,6 +2967,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             _isConnecting = false;
             Raise(nameof(ConnectButtonText));
+            Raise(nameof(IsConnectionBusy));
             UpdateConnectVisualState();
             _connectCts?.Dispose();
             _connectCts = null;
@@ -2293,6 +2978,56 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 _ = Dispatcher.BeginInvoke(new Action(() => _ = RetryConnectAsync()));
             }
         }
+    }
+
+    private bool TryScheduleWebTunnelFallbackRetry(string logMessage)
+    {
+        if (_autoFallbackToWebTunnelUsed)
+        {
+            return false;
+        }
+
+        if (_cancelConnectRequested)
+        {
+            return false;
+        }
+
+        if (!UseTorBridges || HasCustomBridgeLines())
+        {
+            return false;
+        }
+
+        if (string.Equals(SelectedBridgeType, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        // Only fallback for the "built-in" bridge types where users commonly get blocked.
+        if (!string.Equals(SelectedBridgeType, "snowflake", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(SelectedBridgeType, "obfs4", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(SelectedBridgeType, "meek", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(SelectedBridgeType, "meek-azure", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (_ptConfig?.Bridges == null || !_ptConfig.Bridges.TryGetValue(WebTunnelBridgeType, out var bridges)
+            || bridges.All(IsPlaceholderBridgeLine))
+        {
+            return false;
+        }
+
+        _autoFallbackToWebTunnelUsed = true;
+        AppendLog(logMessage);
+
+        var wasLoading = _loadingSettings;
+        _loadingSettings = true;
+        SelectedBridgeType = WebTunnelBridgeType;
+        _loadingSettings = wasLoading;
+
+        _pendingAutoRetry = true;
+        _autoRetryConnectUsed = true; // don't double-retry; fallback is the retry
+        return true;
     }
 
     private bool ShouldAutoRetryConnect()
@@ -2336,6 +3071,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         _isDisconnecting = true;
         Raise(nameof(ConnectButtonText));
+        Raise(nameof(IsConnectionBusy));
         UpdateConnectVisualState();
         StatusMessage = "Stopping Tor...";
         ConnectionStatus = "Disconnecting...";
@@ -2359,12 +3095,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _viewModel.IsConnected = false;
         _isDisconnecting = false;
         Raise(nameof(ConnectButtonText));
+        Raise(nameof(IsConnectionBusy));
         UpdateConnectVisualState();
         ConnectionStatus = "Disconnected";
         ConnectionProgress = 0;
         StatusBrush = new SolidColorBrush(Color.FromRgb(209, 67, 75));
         StatusMessage = "Tor stopped. Traffic is back to normal.";
-        CurrentIp = "--.--.--.--";
+        CurrentIp = "Resolving...";
+        _ = UpdateCurrentIpAsync(updateStatusMessage: false);
     }
 
     private const int MaxLogLines = 500;
@@ -2389,7 +3127,41 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     }
                 }
             }
+
+            TryScrollToEnd(AppLogsListBox);
         });
+    }
+
+    private void AppendDnsLog(string message)
+    {
+        var line = $"{DateTime.Now:HH:mm:ss} {message}";
+        Dispatcher.Invoke(() =>
+        {
+            lock (_dnsLogLock)
+            {
+                DnsLogLines.Add(line);
+                if (DnsLogLines.Count > MaxLogLines + LogTrimBatchSize)
+                {
+                    var toRemove = DnsLogLines.Count - MaxLogLines;
+                    for (var i = 0; i < toRemove; i++)
+                    {
+                        DnsLogLines.RemoveAt(0);
+                    }
+                }
+            }
+
+            TryScrollToEnd(DnsLogsListBox);
+        });
+    }
+
+    private static void TryScrollToEnd(System.Windows.Controls.ListBox? listBox)
+    {
+        if (listBox == null || !listBox.IsVisible || listBox.Items.Count == 0)
+        {
+            return;
+        }
+
+        listBox.ScrollIntoView(listBox.Items[listBox.Items.Count - 1]);
     }
 
 
@@ -2422,6 +3194,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         ShowLogs = false;
         ShowAbout = false;
         ShowSettings = false;
+        ShowDnsLogs = false;
     }
 
     private void OverlayBackground_MouseDown(object sender, MouseButtonEventArgs e)
@@ -2439,6 +3212,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         lock (_logLock)
         {
             return string.Join(Environment.NewLine, LogLines);
+        }
+    }
+
+    private string GetDnsLogsText()
+    {
+        lock (_dnsLogLock)
+        {
+            return string.Join(Environment.NewLine, DnsLogLines);
         }
     }
 
@@ -2491,6 +3272,55 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
+    private void CopyDnsLogs_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var text = GetDnsLogsText();
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                StatusMessage = "No DNS logs to copy.";
+                return;
+            }
+
+            Clipboard.SetText(text);
+            StatusMessage = "DNS logs copied to clipboard.";
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = $"Copy failed: {ex.Message}";
+            AppendLog($"Copy DNS logs failed: {ex.Message}");
+        }
+    }
+
+    private void ExportDnsLogs_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var dialog = new SaveFileDialog
+            {
+                Title = "Export OnionHop DNS Logs",
+                Filter = "Text files (*.txt)|*.txt|All files (*.*)|*.*",
+                FileName = $"OnionHop-dns-logs-{DateTime.Now:yyyyMMdd-HHmmss}.txt"
+            };
+
+            if (dialog.ShowDialog() != true)
+            {
+                return;
+            }
+
+            var text = GetDnsLogsText();
+            File.WriteAllText(dialog.FileName, text, Encoding.UTF8);
+            StatusMessage = $"DNS logs exported to {Path.GetFileName(dialog.FileName)}";
+            AppendLog($"DNS logs exported: {dialog.FileName}");
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = $"Export failed: {ex.Message}";
+            AppendLog($"Export DNS logs failed: {ex.Message}");
+        }
+    }
+
     private void DiscordButton_Click(object sender, RoutedEventArgs e)
     {
         try
@@ -2510,6 +3340,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         var singBoxPath = Path.Combine(AppContext.BaseDirectory, DefaultSingBoxRelativePath);
         var wintunPath = Path.Combine(AppContext.BaseDirectory, DefaultWintunRelativePath);
+        var doh = ResolveDohSettings();
         var config = new VpnLaunchConfig
         {
             SingBoxPath = singBoxPath,
@@ -2517,6 +3348,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             HybridRouting = UseHybridRouting,
             SecureDns = UseCensoredMode,
             SocksPort = SocksPort,
+            DohServer = doh.Server,
+            DohServerPort = doh.Port,
+            DohPath = doh.Path,
             BrowserProcessNames = BrowserProcessNames,
             ProcessStarted = process => TryAssignProcessToJob(process, "sing-box")
         };
@@ -2549,6 +3383,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         AppendLog($"sing-box: {line}");
+        if (LooksLikeDnsLogLine(line))
+        {
+            AppendDnsLog($"sing-box: {line}");
+        }
 
         lock (_singBoxLogLock)
         {
@@ -2587,6 +3425,15 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             Dispatcher.Invoke(() => StatusMessage = $"VPN tunnel: {line}");
         }
+    }
+
+    private static bool LooksLikeDnsLogLine(string line)
+    {
+        return line.Contains("dns:", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("hijack-dns", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("[dns]", StringComparison.OrdinalIgnoreCase)
+               || line.Contains(" protocol=dns", StringComparison.OrdinalIgnoreCase)
+               || line.Contains(" protocol dns", StringComparison.OrdinalIgnoreCase);
     }
 
     private void OnSingBoxExited(object? sender, EventArgs e)
@@ -2806,49 +3653,56 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private Task<IReadOnlyList<string>> GetBridgeLinesAsync(CancellationToken token)
     {
+        IReadOnlyList<string> selected = Array.Empty<string>();
+        var usingCustom = false;
+
         var custom = ExtractBridgeLines(CustomBridges);
         if (custom.Count > 0)
         {
-            if (string.Equals(SelectedBridgeType, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase))
+            selected = custom;
+            usingCustom = true;
+        }
+        else if (_ptConfig?.Bridges != null &&
+                 _ptConfig.Bridges.TryGetValue(SelectedBridgeType, out var bridges) &&
+                 bridges.Count > 0)
+        {
+            selected = bridges;
+        }
+
+        if (selected.Count > 0 &&
+            string.Equals(SelectedBridgeType, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase))
+        {
+            var filtered = selected.Where(line => !IsPlaceholderBridgeLine(line)).ToList();
+            if (filtered.Count == 0)
             {
-                var filtered = custom.Where(line => !IsPlaceholderBridgeLine(line)).ToList();
-                if (filtered.Count == 0)
+                if (usingCustom)
                 {
                     AppendLog("Webtunnel bridge lines look like examples (2001:db8/192.0.2/etc). Attempting anyway.");
-                    return Task.FromResult<IReadOnlyList<string>>(custom);
                 }
-
-                if (filtered.Count != custom.Count)
+                else
+                {
+                    AppendLog("No usable webtunnel bridges. Get bridges from bridges.torproject.org and paste in Custom Bridges.");
+                    selected = Array.Empty<string>();
+                }
+            }
+            else
+            {
+                if (usingCustom && filtered.Count != selected.Count)
                 {
                     AppendLog("Removed example WebTunnel bridge lines (use real BridgeDB entries).");
                 }
 
-                return Task.FromResult<IReadOnlyList<string>>(filtered);
+                selected = filtered;
             }
-
-            return Task.FromResult<IReadOnlyList<string>>(custom);
         }
 
-        if (_ptConfig?.Bridges != null &&
-            _ptConfig.Bridges.TryGetValue(SelectedBridgeType, out var bridges) &&
-            bridges.Count > 0)
+        var customSni = ExtractSniHosts(CustomSniHosts);
+        if (customSni.Count > 0 && selected.Count > 0)
         {
-            if (string.Equals(SelectedBridgeType, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase))
-            {
-                var filtered = bridges.Where(line => !IsPlaceholderBridgeLine(line)).ToList();
-                if (filtered.Count == 0)
-                {
-                    AppendLog("No usable webtunnel bridges. Get bridges from bridges.torproject.org and paste in Custom Bridges.");
-                    return Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
-                }
-
-                return Task.FromResult<IReadOnlyList<string>>(filtered);
-            }
-
-            return Task.FromResult<IReadOnlyList<string>>(bridges);
+            selected = ApplyCustomSniHosts(selected, customSni);
         }
 
-        return Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
+        return Task.FromResult(selected);
     }
 
     private static List<string> ExtractBridgeLines(string? text)
@@ -2883,6 +3737,112 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         return results;
+    }
+
+    private static List<string> ExtractSniHosts(string? text)
+    {
+        var results = new List<string>();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return results;
+        }
+
+        using var reader = new StringReader(text);
+        string? line;
+        while ((line = reader.ReadLine()) != null)
+        {
+            line = line.Trim();
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            if (line.StartsWith("#", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            foreach (var raw in line.Split(new[] { ',', ';', ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (TryNormalizeSniHost(raw, out var host))
+                {
+                    results.Add(host);
+                }
+            }
+        }
+
+        return results.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    private static bool TryNormalizeSniHost(string raw, out string host)
+    {
+        host = string.Empty;
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return false;
+        }
+
+        var trimmed = raw.Trim();
+
+        if (Uri.TryCreate(trimmed, UriKind.Absolute, out var uri) && !string.IsNullOrWhiteSpace(uri.Host))
+        {
+            host = uri.Host;
+        }
+        else if (Uri.TryCreate($"https://{trimmed}", UriKind.Absolute, out uri) && !string.IsNullOrWhiteSpace(uri.Host))
+        {
+            host = uri.Host;
+        }
+        else
+        {
+            host = trimmed;
+        }
+
+        host = host.Trim().TrimEnd('/');
+        if (host.StartsWith("*.", StringComparison.Ordinal))
+        {
+            host = host.Substring(2);
+        }
+
+        if (host.Length == 0)
+        {
+            return false;
+        }
+
+        if (IPAddress.TryParse(host, out _))
+        {
+            return true;
+        }
+
+        // Strip a single :port suffix if present (and not an IPv6 literal).
+        var firstColon = host.IndexOf(':');
+        var lastColon = host.LastIndexOf(':');
+        if (firstColon > 0 && firstColon == lastColon)
+        {
+            host = host.Substring(0, firstColon);
+        }
+
+        return host.Length > 0;
+    }
+
+    private static IReadOnlyList<string> ApplyCustomSniHosts(IReadOnlyList<string> bridgeLines, IReadOnlyList<string> sniHosts)
+    {
+        if (bridgeLines.Count == 0 || sniHosts.Count == 0)
+        {
+            return bridgeLines;
+        }
+
+        var frontsValue = string.Join(",", sniHosts);
+        var updated = new List<string>(bridgeLines.Count);
+        foreach (var line in bridgeLines)
+        {
+            var chosen = sniHosts[Random.Shared.Next(sniHosts.Count)];
+            var modified = BridgeFrontsRegex.Replace(line, $"fronts={frontsValue}");
+            modified = BridgeFrontRegex.Replace(modified, $"front={chosen}");
+            modified = BridgeSniRegex.Replace(modified, $"sni={chosen}");
+            updated.Add(modified);
+        }
+
+        return updated;
     }
 
     private IReadOnlyList<string> GetClientTransportPlugins(IReadOnlyList<string> bridgeLines, string torDir)
@@ -2964,6 +3924,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 continue;
             }
 
+            if (string.Equals(transport, "snowflake", StringComparison.OrdinalIgnoreCase))
+            {
+                plugins.Add($"ClientTransportPlugin snowflake exec {Path.Combine(ptPath, "snowflake-client.exe")}");
+                continue;
+            }
             if (string.Equals(transport, "conjure", StringComparison.OrdinalIgnoreCase))
             {
                 plugins.Add($"ClientTransportPlugin conjure exec {Path.Combine(ptPath, "conjure-client.exe")} -registerURL https://registration.refraction.network/api");
@@ -3238,6 +4203,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             Dispatcher.Invoke(() =>
             {
                 ConnectionProgress = percent / 100d;
+                if (_isConnecting)
+                {
+                    var summary = ExtractBootstrapSummary(line);
+                    if (!string.IsNullOrWhiteSpace(summary))
+                    {
+                        StatusMessage = summary;
+                    }
+                }
                 if (percent >= 100)
                 {
                     _bootstrapSource?.TrySetResult(true);
@@ -3245,16 +4218,58 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             });
 
             AppendLog($"Tor bootstrapped: {line}");
+            return;
         }
-        else if (line.Contains("Failed", StringComparison.OrdinalIgnoreCase))
+
+        if (IsFatalTorBootstrapLine(line))
         {
             AppendLog($"Tor error: {line}");
             Dispatcher.Invoke(() => _bootstrapSource?.TrySetException(new InvalidOperationException(line)));
+            return;
         }
-        else if (line.Contains("warn", StringComparison.OrdinalIgnoreCase) || line.Contains("error", StringComparison.OrdinalIgnoreCase))
+
+        if (line.Contains("broker failure", StringComparison.OrdinalIgnoreCase)
+            && line.Contains("snowflake", StringComparison.OrdinalIgnoreCase))
+        {
+            _snowflakeBrokerFailureSeen = true;
+            if (line.Contains("no snowflake proxies currently available", StringComparison.OrdinalIgnoreCase))
+            {
+                _snowflakeNoProxiesSeen = true;
+            }
+            AppendLog($"Tor log: {line}");
+            if (_isConnecting)
+            {
+                Dispatcher.Invoke(() => StatusMessage = _snowflakeNoProxiesSeen
+                    ? "Snowflake: no proxies available right now. Still trying..."
+                    : "Snowflake broker unreachable. Still trying to connect...");
+            }
+            return;
+        }
+
+        if (ShouldLogTorLine(line))
         {
             AppendLog($"Tor log: {line}");
         }
+    }
+
+    private static bool IsFatalTorBootstrapLine(string line)
+    {
+        return line.Contains("no configured transport called", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("no such transport is supported", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("didn't launch any pluggable transport listeners", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("failed to bind", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("could not bind", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("address already in use", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("no such file or directory", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ShouldLogTorLine(string line)
+    {
+        return line.Contains("Failed", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("[warn]", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("[err]", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("warn", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("error", StringComparison.OrdinalIgnoreCase);
     }
 
     private static int ExtractProgress(string line)
@@ -3275,56 +4290,266 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return int.TryParse(number, out var value) ? value : 0;
     }
 
-    private async Task UpdateCurrentIpAsync()
+    private static string? ExtractBootstrapSummary(string line)
     {
+        // Example: "Bootstrapped 25% (requesting_status): Asking for networkstatus consensus"
+        var colonIndex = line.IndexOf("):", StringComparison.Ordinal);
+        if (colonIndex < 0 || colonIndex + 2 >= line.Length)
+        {
+            return null;
+        }
+
+        var summary = line[(colonIndex + 2)..].Trim();
+        if (string.IsNullOrWhiteSpace(summary))
+        {
+            return null;
+        }
+
+        return summary;
+    }
+
+    private async Task UpdateCurrentIpAsync(bool updateStatusMessage = true)
+    {
+        var lookupSequence = Interlocked.Increment(ref _ipLookupSequence);
+        var torFirst = _isConnected && _torService.IsRunning;
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(18));
+
         try
         {
-            if (SystemWideMode && !UseHybridRouting)
+            string? ip = null;
+
+            if (torFirst)
             {
-                // Need custom handler for proxy, can't use singleton here
-                using var handler = new HttpClientHandler { UseProxy = true };
-                using var client = HttpClientFactory.CreateWithHandler(handler, TimeSpan.FromSeconds(35));
-
-                var response = await client.GetAsync("https://check.torproject.org/api/ip");
-                response.EnsureSuccessStatusCode();
-
-                await using var stream = await response.Content.ReadAsStreamAsync();
-                var doc = await JsonDocument.ParseAsync(stream);
-                if (doc.RootElement.TryGetProperty("IP", out var ipProperty))
+                ip = await TryFetchTorExitIpAsync(cts.Token).ConfigureAwait(false);
+                if (!string.IsNullOrWhiteSpace(ip))
                 {
-                    CurrentIp = ipProperty.GetString() ?? CurrentIp;
-                }
-                else
-                {
-                    CurrentIp = await response.Content.ReadAsStringAsync();
-                }
+                    if (lookupSequence != _ipLookupSequence)
+                    {
+                        return;
+                    }
 
-                StatusMessage = "IP refreshed via Tor route.";
+                    CurrentIp = ip;
+                    if (updateStatusMessage)
+                    {
+                        StatusMessage = "Tor exit IP refreshed.";
+                    }
+                    return;
+                }
             }
-            else
+
+            ip = await TryFetchDirectIpAsync(cts.Token).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(ip))
             {
-                CurrentIp = await HttpClientFactory.Default.GetStringAsync("https://api.ipify.org");
-                StatusMessage = SystemWideMode
-                    ? "Hybrid mode: your browser is routed via Tor. Current IP shows your normal route."
-                    : "IP refreshed.";
+                if (lookupSequence != _ipLookupSequence)
+                {
+                    return;
+                }
+
+                CurrentIp = ip;
+                if (updateStatusMessage)
+                {
+                    StatusMessage = torFirst
+                        ? "Tor IP lookup failed. Showing direct IP."
+                        : "Direct IP refreshed.";
+                }
+                return;
+            }
+
+            if (lookupSequence != _ipLookupSequence)
+            {
+                return;
+            }
+
+            CurrentIp = "--.--.--.--";
+            if (updateStatusMessage)
+            {
+                StatusMessage = "Unable to fetch IP.";
             }
         }
-        catch (Exception)
+        catch (OperationCanceledException)
         {
-            try
+            if (lookupSequence != _ipLookupSequence)
             {
-                CurrentIp = await HttpClientFactory.Default.GetStringAsync("https://api.ipify.org");
-                StatusMessage = "IP fetched via standard route (Tor lookup failed).";
+                return;
             }
-            catch (Exception ex)
+
+            CurrentIp = "--.--.--.--";
+            if (updateStatusMessage)
+            {
+                StatusMessage = "IP lookup timed out.";
+            }
+        }
+        catch (Exception ex)
+        {
+            if (lookupSequence != _ipLookupSequence)
+            {
+                return;
+            }
+
+            CurrentIp = "--.--.--.--";
+            if (updateStatusMessage)
             {
                 StatusMessage = $"Unable to fetch IP: {ex.Message}";
             }
         }
     }
 
+    private static readonly Uri[] TorIpEndpoints =
+    {
+        new("https://check.torproject.org/api/ip"),
+        new("https://api.ipify.org"),
+        new("https://checkip.amazonaws.com"),
+        new("https://icanhazip.com")
+    };
+
+    private static readonly Uri[] DirectIpEndpoints =
+    {
+        new("https://api.ipify.org"),
+        new("https://checkip.amazonaws.com"),
+        new("https://icanhazip.com"),
+        new("https://ifconfig.me/ip")
+    };
+
+    private async Task<string?> TryFetchTorExitIpAsync(CancellationToken token)
+    {
+        try
+        {
+            using var client = Socks5HttpClient.Create("127.0.0.1", SocksPort, TimeSpan.FromSeconds(12));
+            return await TryFetchIpFromAnyAsync(client, TorIpEndpoints, token).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Tor IP lookup failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    private async Task<string?> TryFetchDirectIpAsync(CancellationToken token)
+    {
+        try
+        {
+            return await TryFetchIpFromAnyAsync(HttpClientFactory.Default, DirectIpEndpoints, token).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Direct IP lookup failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    private static async Task<string?> TryFetchIpFromAnyAsync(HttpClient client, IReadOnlyList<Uri> endpoints, CancellationToken token)
+    {
+        foreach (var endpoint in endpoints)
+        {
+            try
+            {
+                using var response = await client.GetAsync(endpoint, token).ConfigureAwait(false);
+                if (!response.IsSuccessStatusCode)
+                {
+                    continue;
+                }
+
+                var content = await response.Content.ReadAsStringAsync(token).ConfigureAwait(false);
+                if (TryExtractIp(content, out var ip))
+                {
+                    return ip;
+                }
+
+                if (TryExtractIpFromJson(content, out ip))
+                {
+                    return ip;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                // Try next endpoint.
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryExtractIpFromJson(string content, out string ip)
+    {
+        ip = string.Empty;
+        var trimmed = content?.Trim();
+        if (string.IsNullOrWhiteSpace(trimmed) || !trimmed.StartsWith("{", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(trimmed);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            foreach (var prop in doc.RootElement.EnumerateObject())
+            {
+                if (!string.Equals(prop.Name, "IP", StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(prop.Name, "ip", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (prop.Value.ValueKind == JsonValueKind.String &&
+                    TryExtractIp(prop.Value.GetString(), out ip))
+                {
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+            return false;
+        }
+
+        return false;
+    }
+
+    private static bool TryExtractIp(string? content, out string ip)
+    {
+        ip = string.Empty;
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            return false;
+        }
+
+        var trimmed = content.Trim();
+        if (IPAddress.TryParse(trimmed, out var parsed))
+        {
+            ip = parsed.ToString();
+            return true;
+        }
+
+        foreach (var token in trimmed.Split(new[] { ' ', '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            var candidate = token.Trim().Trim(',', '"', '\'', '{', '}', '[', ']', ':');
+            if (candidate.Length == 0)
+            {
+                continue;
+            }
+
+            if (IPAddress.TryParse(candidate, out parsed))
+            {
+                ip = parsed.ToString();
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private void StopTorProcess()
     {
+        _torStopRequested = _torService.IsRunning || _torService.ExitCode != null;
         _torService.Stop();
         _lastNewnymUtc = DateTime.MinValue;
     }
@@ -3405,6 +4630,18 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         StopSingBoxProcess(allowElevation: false);
         StopTorProcess();
+
+        try
+        {
+            if (_dnsClientPollTimer != null)
+            {
+                _dnsClientPollTimer.Stop();
+                _dnsClientPollTimer = null;
+            }
+        }
+        catch
+        {
+        }
         
         // Shutdown admin helper if connected (don't wait forever)
         try
@@ -3689,6 +4926,71 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         };
     }
 
+    private readonly record struct DohSettings(string Server, int Port, string Path);
+
+    private DohSettings ResolveDohSettings()
+    {
+        var provider = SelectedDnsProvider;
+        if (string.IsNullOrWhiteSpace(provider))
+        {
+            provider = DnsProviderCloudflare;
+        }
+
+        var server = provider switch
+        {
+            DnsProviderGoogle => "dns.google",
+            DnsProviderQuad9 => "dns.quad9.net",
+            DnsProviderCustom => CustomDohHost,
+            _ => "cloudflare-dns.com"
+        };
+
+        var path = provider == DnsProviderCustom ? CustomDohPath : "/dns-query";
+        var port = 443;
+
+        if (provider == DnsProviderCustom)
+        {
+            var normalized = NormalizeDohHost(CustomDohHost);
+            server = normalized.Server;
+            port = normalized.Port;
+            path = NormalizeDohPath(CustomDohPath);
+        }
+
+        if (string.IsNullOrWhiteSpace(server))
+        {
+            server = "cloudflare-dns.com";
+        }
+
+        return new DohSettings(server, port, path);
+    }
+
+    private static DohSettings NormalizeDohHost(string? rawHost)
+    {
+        var host = (rawHost ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(host))
+        {
+            return new DohSettings("cloudflare-dns.com", 443, "/dns-query");
+        }
+
+        // Allow users to paste a full URL or host[:port].
+        if (Uri.TryCreate(host, UriKind.Absolute, out var uri) && !string.IsNullOrWhiteSpace(uri.Host))
+        {
+            return new DohSettings(uri.Host, uri.IsDefaultPort ? 443 : uri.Port, "/dns-query");
+        }
+
+        if (Uri.TryCreate($"https://{host}", UriKind.Absolute, out uri) && !string.IsNullOrWhiteSpace(uri.Host))
+        {
+            return new DohSettings(uri.Host, uri.IsDefaultPort ? 443 : uri.Port, "/dns-query");
+        }
+
+        return new DohSettings(host, 443, "/dns-query");
+    }
+
+    private static string NormalizeDohPath(string? rawPath)
+    {
+        var path = string.IsNullOrWhiteSpace(rawPath) ? "/dns-query" : rawPath.Trim();
+        return path.StartsWith("/", StringComparison.Ordinal) ? path : "/" + path;
+    }
+
     private bool SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
     {
         if (Equals(field, value))
@@ -3727,7 +5029,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             or nameof(UseTorBridges)
             or nameof(UseCensoredMode)
             or nameof(SelectedBridgeType)
-            or nameof(CustomBridges))
+            or nameof(CustomBridges)
+            or nameof(CustomSniHosts)
+            or nameof(SelectedDnsProvider)
+            or nameof(CustomDohHost)
+            or nameof(CustomDohPath))
         {
             ScheduleSaveUserSettings();
         }
@@ -3741,6 +5047,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void LogsButton_Click(object sender, RoutedEventArgs e)
     {
         ShowLogs = true;
+        _ = Dispatcher.BeginInvoke(new Action(() => TryScrollToEnd(AppLogsListBox)));
+    }
+
+    private void DnsLogsButton_Click(object sender, RoutedEventArgs e)
+    {
+        ShowDnsLogs = true;
+        _ = Dispatcher.BeginInvoke(new Action(() => TryScrollToEnd(DnsLogsListBox)));
     }
 
     private void AboutButton_Click(object sender, RoutedEventArgs e)
@@ -3753,6 +5066,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         ShowLogs = false;
         ShowAbout = false;
         ShowSettings = false;
+        ShowDnsLogs = false;
         StatusMessage = "Dashboard is active.";
     }
 

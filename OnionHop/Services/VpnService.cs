@@ -51,7 +51,14 @@ internal sealed class VpnService : IDisposable
         Directory.CreateDirectory(configDir);
         var configPath = Path.Combine(configDir, "sing-box.json");
 
-        var configJson = BuildConfigJson(config.HybridRouting, config.SecureDns, config.SocksPort, config.BrowserProcessNames);
+        var configJson = BuildConfigJson(
+            config.HybridRouting,
+            config.SecureDns,
+            config.SocksPort,
+            config.BrowserProcessNames,
+            config.DohServer,
+            config.DohServerPort,
+            config.DohPath);
         await File.WriteAllTextAsync(configPath, configJson, token);
 
         _log($"Starting sing-box with config: {configPath}");
@@ -152,7 +159,14 @@ internal sealed class VpnService : IDisposable
         OutputReceived?.Invoke(sender, e);
     }
 
-    private static string BuildConfigJson(bool hybridRouting, bool secureDns, int socksPort, IReadOnlyList<string> browserProcessNames)
+    private static string BuildConfigJson(
+        bool hybridRouting,
+        bool secureDns,
+        int socksPort,
+        IReadOnlyList<string> browserProcessNames,
+        string? dohServer,
+        int dohServerPort,
+        string? dohPath)
     {
         var rules = new List<object>
         {
@@ -175,23 +189,32 @@ internal sealed class VpnService : IDisposable
             rules.Add(new { network = "tcp", port = new[] { 80, 443 }, outbound = "tor" });
         }
 
+        var resolvedDohServer = string.IsNullOrWhiteSpace(dohServer) ? "cloudflare-dns.com" : dohServer.Trim();
+        var resolvedDohPath = string.IsNullOrWhiteSpace(dohPath) ? "/dns-query" : dohPath.Trim();
+        if (!resolvedDohPath.StartsWith("/", StringComparison.Ordinal))
+        {
+            resolvedDohPath = "/" + resolvedDohPath;
+        }
+
+        var resolvedDohPort = dohServerPort is > 0 and <= 65535 ? dohServerPort : 443;
+
         object dnsServer = secureDns
             ? hybridRouting
                 ? new
                 {
                     tag = "remote",
                     type = "https",
-                    server = "cloudflare-dns.com",
-                    server_port = 443,
-                    path = "/dns-query"
+                    server = resolvedDohServer,
+                    server_port = resolvedDohPort,
+                    path = resolvedDohPath
                 }
                 : new
                 {
                     tag = "remote",
                     type = "https",
-                    server = "cloudflare-dns.com",
-                    server_port = 443,
-                    path = "/dns-query",
+                    server = resolvedDohServer,
+                    server_port = resolvedDohPort,
+                    path = resolvedDohPath,
                     detour = "tor"
                 }
             : hybridRouting
@@ -215,7 +238,7 @@ internal sealed class VpnService : IDisposable
         {
             log = new
             {
-                level = "info",
+                level = secureDns ? "debug" : "info",
                 timestamp = true
             },
             dns = new
@@ -278,6 +301,9 @@ internal sealed class VpnLaunchConfig
     public bool HybridRouting { get; init; }
     public bool SecureDns { get; init; }
     public int SocksPort { get; init; }
+    public string DohServer { get; init; } = "cloudflare-dns.com";
+    public int DohServerPort { get; init; } = 443;
+    public string DohPath { get; init; } = "/dns-query";
     public IReadOnlyList<string> BrowserProcessNames { get; init; } = Array.Empty<string>();
     [JsonIgnore]
     public Action<Process>? ProcessStarted { get; init; }

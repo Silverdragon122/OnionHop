@@ -10,6 +10,7 @@ internal sealed class MainViewModel : INotifyPropertyChanged
     private string _selectedLocation = "Automatic";
 
     public ObservableCollection<string> LogLines { get; } = new();
+    public ObservableCollection<string> DnsLogLines { get; } = new();
 
     public bool IsConnected
     {

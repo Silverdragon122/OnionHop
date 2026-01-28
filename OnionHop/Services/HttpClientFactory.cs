@@ -1,4 +1,5 @@
 using System;
+using System.Net;
 using System.Net.Http;
 
 namespace OnionHop;
@@ -11,7 +12,16 @@ internal static class HttpClientFactory
 {
     private static readonly Lazy<HttpClient> DefaultClientLazy = new(() =>
     {
-        var client = new HttpClient
+        // OnionHop may set the system proxy to a SOCKS endpoint (Tor).
+        // .NET's HttpClient does not support SOCKS system proxies, so we explicitly bypass
+        // system proxy settings for internal API calls (updates, IP checks, etc.).
+        var handler = new SocketsHttpHandler
+        {
+            UseProxy = false,
+            AutomaticDecompression = DecompressionMethods.All
+        };
+
+        var client = new HttpClient(handler)
         {
             Timeout = TimeSpan.FromSeconds(30)
         };
@@ -21,7 +31,13 @@ internal static class HttpClientFactory
 
     private static readonly Lazy<HttpClient> LongTimeoutClientLazy = new(() =>
     {
-        var client = new HttpClient
+        var handler = new SocketsHttpHandler
+        {
+            UseProxy = false,
+            AutomaticDecompression = DecompressionMethods.All
+        };
+
+        var client = new HttpClient(handler)
         {
             Timeout = TimeSpan.FromMinutes(5)
         };

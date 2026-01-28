@@ -426,6 +426,12 @@
                                     <TextBlock Text="Logs"/>
                                 </StackPanel>
                             </Button>
+                            <Button Style="{StaticResource NavButton}" Click="DnsLogsButton_Click">
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="&#xE774;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="#3c8dd1" Margin="0,0,10,0"/>
+                                    <TextBlock Text="DNS Log"/>
+                                </StackPanel>
+                            </Button>
                             <Button Style="{StaticResource NavButton}" Click="AboutButton_Click">
                                 <StackPanel Orientation="Horizontal">
                                     <TextBlock Text="&#xE946;" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="#48536c" Margin="0,0,10,0"/>
@@ -540,7 +546,11 @@
                                                         Focusable="False">
                                                     <Button.Template>
                                                         <ControlTemplate TargetType="Button">
-                                                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                            <Grid>
+                                                                <!-- Ensure the entire circle is clickable (not only the text). -->
+                                                                <Ellipse Fill="Transparent" Cursor="{TemplateBinding Cursor}"/>
+                                                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                            </Grid>
                                                         </ControlTemplate>
                                                     </Button.Template>
                                                     <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
@@ -584,7 +594,6 @@
                                     <Ellipse Width="12" Height="12" Fill="{Binding StatusBrush}"/>
                                     <TextBlock Text="{Binding ConnectionStatus}" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}" Margin="8,0,0,0"/>
                                 </StackPanel>
-                                <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" Margin="0,8,0,0" Foreground="{DynamicResource TertiaryTextBrush}" FontSize="12"/>
                                 <Border Background="{DynamicResource NavBackgroundBrush}" CornerRadius="12" Padding="12" Margin="0,12,0,0">
                                     <StackPanel>
                                         <TextBlock Text="Current IP" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}"/>
@@ -601,8 +610,7 @@
                                     <TextBlock Text="Action Center" FontSize="14" FontWeight="Bold" Foreground="{DynamicResource PrimaryTextBrush}" Margin="8,0,0,0"/>
                                 </StackPanel>
                                 <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
-                                    <Button Style="{StaticResource SegmentedButton}" Width="120" Click="RefreshIpButton_Click">Refresh IP</Button>
-                                    <Button Style="{StaticResource SegmentedButton}" Width="120" Margin="10,0,0,0" Click="DisconnectButton_Click">Disconnect</Button>
+                                    <Button Style="{StaticResource SegmentedButton}" Width="250" Click="DisconnectButton_Click">Disconnect</Button>
                                 </StackPanel>
                                 <Grid Margin="0,10,0,0">
                                     <Button Style="{StaticResource SegmentedButton}" Width="250" HorizontalAlignment="Left"
@@ -611,13 +619,23 @@
                                         Change Identity
                                     </Button>
                                 </Grid>
-                                <TextBlock Text="Use refresh to verify your Tor exit node once connected." FontSize="12" Foreground="{DynamicResource TertiaryTextBrush}" Margin="0,10,0,0" TextWrapping="Wrap"/>
                             </StackPanel>
                         </Border>
                     </StackPanel>
                 </Grid>
             </Border>
         </Grid>
+
+        <!-- Bottom connection activity bar (visible during connect/disconnect) -->
+        <ProgressBar Grid.RowSpan="2"
+                     Height="4"
+                     Margin="18,0,18,14"
+                     VerticalAlignment="Bottom"
+                     IsIndeterminate="True"
+                     Visibility="{Binding IsConnectionBusy, Converter={StaticResource BoolToVis}}"
+                     Background="#00000000"
+                     Foreground="#3c8dd1"
+                     BorderThickness="0"/>
 
         <Grid Grid.RowSpan="2" Background="{DynamicResource OverlayScrimBrush}" Visibility="{Binding IsOverlayVisible, Converter={StaticResource BoolToVis}}"
               MouseDown="OverlayBackground_MouseDown">
@@ -634,6 +652,8 @@
                         <Grid DockPanel.Dock="Left">
                             <TextBlock Text="Logs" FontSize="16" FontWeight="Bold" Foreground="{DynamicResource PrimaryTextBrush}"
                                        Visibility="{Binding ShowLogs, Converter={StaticResource BoolToVis}}"/>
+                            <TextBlock Text="DNS Log" FontSize="16" FontWeight="Bold" Foreground="{DynamicResource PrimaryTextBrush}"
+                                       Visibility="{Binding ShowDnsLogs, Converter={StaticResource BoolToVis}}"/>
                             <TextBlock Text="About" FontSize="16" FontWeight="Bold" Foreground="{DynamicResource PrimaryTextBrush}"
                                        Visibility="{Binding ShowAbout, Converter={StaticResource BoolToVis}}"/>
                             <TextBlock Text="Settings" FontSize="16" FontWeight="Bold" Foreground="{DynamicResource PrimaryTextBrush}"
@@ -651,13 +671,42 @@
                                     <RowDefinition Height="Auto"/>
                                 </Grid.RowDefinitions>
                                 <TextBlock Text="Logs" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
-                                <ListBox Grid.Row="1" Margin="0,10,0,0" ItemsSource="{Binding LogLines}" Background="{DynamicResource CardBackgroundBrush}" Foreground="{DynamicResource PrimaryTextBrush}" BorderThickness="1" BorderBrush="{DynamicResource InputBorderBrush}"
+                                <ListBox x:Name="AppLogsListBox" Grid.Row="1" Margin="0,10,0,0" ItemsSource="{Binding LogLines}" Background="{DynamicResource CardBackgroundBrush}" Foreground="{DynamicResource PrimaryTextBrush}" BorderThickness="1" BorderBrush="{DynamicResource InputBorderBrush}"
                                          FontFamily="Consolas" FontSize="12"/>
                                 <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Left" Margin="0,10,0,0">
                                     <Button Style="{StaticResource SegmentedButton}" Width="110" Margin="0,0,10,0"
                                             Click="CopyLogs_Click">Copy</Button>
                                     <Button Style="{StaticResource SegmentedButton}" Width="110"
                                             Click="ExportLogs_Click">Export</Button>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+
+                        <Border CornerRadius="14" Background="{DynamicResource NavBackgroundBrush}" Padding="12"
+                                Visibility="{Binding ShowDnsLogs, Converter={StaticResource BoolToVis}}">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="*"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+                                <TextBlock Text="DNS Log" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}"/>
+                                <Border Grid.Row="1" Margin="0,10,0,0" Padding="10" CornerRadius="10" Background="{DynamicResource CardBackgroundBrush}"
+                                        Visibility="{Binding DnsClientLogNeedsEnable, Converter={StaticResource BoolToVis}}">
+                                    <StackPanel>
+                                        <TextBlock Text="Windows DNS Client Operational log is disabled on this system." Foreground="{DynamicResource PrimaryTextBrush}" TextWrapping="Wrap"/>
+                                        <Button Style="{StaticResource SegmentedButton}" Width="220" Margin="0,10,0,0"
+                                                Click="EnableDnsClientLog_Click">Enable DNS Client Log</Button>
+                                    </StackPanel>
+                                </Border>
+                                <ListBox x:Name="DnsLogsListBox" Grid.Row="2" Margin="0,10,0,0" ItemsSource="{Binding DnsLogLines}" Background="{DynamicResource CardBackgroundBrush}" Foreground="{DynamicResource PrimaryTextBrush}" BorderThickness="1" BorderBrush="{DynamicResource InputBorderBrush}"
+                                         FontFamily="Consolas" FontSize="12"/>
+                                <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Left" Margin="0,10,0,0">
+                                    <Button Style="{StaticResource SegmentedButton}" Width="110" Margin="0,0,10,0"
+                                            Click="CopyDnsLogs_Click">Copy</Button>
+                                    <Button Style="{StaticResource SegmentedButton}" Width="110"
+                                            Click="ExportDnsLogs_Click">Export</Button>
                                 </StackPanel>
                             </Grid>
                         </Border>
@@ -774,6 +823,59 @@
                                             <TextBlock Text="Enable SNI bridges + Secure DNS (DoH) for restricted regions" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" TextWrapping="Wrap"/>
                                         </StackPanel>
                                     </DockPanel>
+
+                                    <Border Margin="0,10,0,0" Background="{DynamicResource CardBackgroundBrush}" CornerRadius="12" Padding="10"
+                                            Visibility="{Binding UseCensoredMode, Converter={StaticResource BoolToVis}}">
+                                        <StackPanel>
+                                            <TextBlock Text="Secure DNS (DoH)" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}" FontSize="12"/>
+                                            <ComboBox Margin="0,6,0,0"
+                                                      ItemsSource="{Binding DnsProviders}"
+                                                      SelectedItem="{Binding SelectedDnsProvider}"
+                                                      Foreground="{DynamicResource PrimaryTextBrush}"
+                                                      Style="{StaticResource LightCombo}"
+                                                      MaxDropDownHeight="200"/>
+
+                                            <StackPanel Margin="0,10,0,0"
+                                                        Visibility="{Binding IsCustomDnsProvider, Converter={StaticResource BoolToVis}}">
+                                                <TextBlock Text="Custom DoH host" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}" FontSize="12"/>
+                                                <TextBox Margin="0,6,0,0"
+                                                         Background="{DynamicResource CardBackgroundBrush}"
+                                                         Foreground="{DynamicResource PrimaryTextBrush}"
+                                                         BorderBrush="{DynamicResource InputBorderBrush}"
+                                                         BorderThickness="1"
+                                                         Padding="8"
+                                                         Text="{Binding CustomDohHost}"/>
+
+                                                <TextBlock Text="Custom DoH path" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}" FontSize="12" Margin="0,10,0,0"/>
+                                                <TextBox Margin="0,6,0,0"
+                                                         Background="{DynamicResource CardBackgroundBrush}"
+                                                         Foreground="{DynamicResource PrimaryTextBrush}"
+                                                         BorderBrush="{DynamicResource InputBorderBrush}"
+                                                         BorderThickness="1"
+                                                         Padding="8"
+                                                         Text="{Binding CustomDohPath}"/>
+                                            </StackPanel>
+
+                                            <Button Style="{StaticResource SegmentedButton}" Width="110" Margin="0,10,0,0" HorizontalAlignment="Left"
+                                                    Click="TestDnsButton_Click">Test DNS</Button>
+                                            <TextBlock Text="{Binding DnsTestStatus}" FontSize="12" Foreground="{DynamicResource SecondaryTextBrush}" Margin="0,8,0,0" TextWrapping="Wrap"/>
+
+                                            <TextBlock Text="Custom SNI / front domains (optional)" FontWeight="SemiBold" Foreground="{DynamicResource PrimaryTextBrush}" FontSize="12" Margin="0,14,0,0"/>
+                                            <TextBox Margin="0,6,0,0"
+                                                     Height="80"
+                                                     AcceptsReturn="True"
+                                                     TextWrapping="Wrap"
+                                                     VerticalScrollBarVisibility="Auto"
+                                                     Background="{DynamicResource CardBackgroundBrush}"
+                                                     Foreground="{DynamicResource PrimaryTextBrush}"
+                                                     BorderBrush="{DynamicResource InputBorderBrush}"
+                                                     BorderThickness="1"
+                                                     Padding="8"
+                                                     Text="{Binding CustomSniHosts}"/>
+                                            <TextBlock Text="Applied to built-in bridges (front=/fronts=/sni=). One domain per line (or comma-separated)."
+                                                       FontSize="12" Foreground="{DynamicResource TertiaryTextBrush}" Margin="0,8,0,0" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                    </Border>
 
                                     <Border Margin="0,10,0,0" Background="{DynamicResource CardBackgroundBrush}" CornerRadius="12" Padding="10"
                                             Visibility="{Binding UseTorBridges, Converter={StaticResource BoolToVis}}">
