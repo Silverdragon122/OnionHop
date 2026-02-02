@@ -1,0 +1,257 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:suki="https://github.com/kikipoulet/SukiUI"
+             xmlns:vm="using:OnionHopV2.App.ViewModels"
+             mc:Ignorable="d"
+             d:DesignWidth="900"
+             d:DesignHeight="720"
+             x:Class="OnionHopV2.App.Views.SettingsPageView"
+             x:DataType="vm:SettingsPageViewModel">
+
+    <TabControl Margin="24">
+        <!-- General / Startup -->
+        <TabItem Header="General">
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <StackPanel Spacing="16" Margin="0,16,0,0">
+                    <suki:GlassCard Padding="18" CornerRadius="18">
+                        <StackPanel Spacing="14">
+                            <TextBlock Text="Startup &amp; Behavior"
+                                       FontSize="16"
+                                       FontWeight="SemiBold" />
+
+                            <ToggleSwitch Content="Auto-connect on launch"
+                                          IsChecked="{Binding State.AutoConnect}" />
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Text="Auto-start" Opacity="0.75" />
+                                <ComboBox ItemsSource="{Binding State.AutoStartModes}"
+                                          SelectedItem="{Binding State.AutoStartMode}" />
+                            </StackPanel>
+
+                            <ToggleSwitch Content="Minimize to tray on close"
+                                          IsChecked="{Binding State.MinimizeToTray}" />
+
+                            <ToggleSwitch Content="Check for updates"
+                                          IsChecked="{Binding State.AutoUpdate}" />
+                        </StackPanel>
+                    </suki:GlassCard>
+
+                    <suki:GlassCard Padding="18" CornerRadius="18">
+                        <StackPanel Spacing="14">
+                            <TextBlock Text="Appearance"
+                                       FontSize="16"
+                                       FontWeight="SemiBold" />
+
+                            <ToggleSwitch Content="Dark mode"
+                                          IsChecked="{Binding State.IsDarkMode}" />
+
+                            <ToggleSwitch Content="Use native window chrome (titlebar/buttons)"
+                                          IsVisible="{Binding State.SupportsNativeWindowChrome}"
+                                          IsChecked="{Binding State.UseNativeTheme}" />
+                        </StackPanel>
+                    </suki:GlassCard>
+
+                    <suki:GlassCard Padding="18" CornerRadius="18">
+                        <StackPanel Spacing="14">
+                            <TextBlock Text="Maintenance"
+                                       FontSize="16"
+                                       FontWeight="SemiBold" />
+
+                            <TextBlock Text="Resets all OnionHop V2 settings back to defaults."
+                                       Opacity="0.75"
+                                       TextWrapping="Wrap" />
+
+                            <Button Classes="Danger"
+                                    Width="220"
+                                    Height="38"
+                                    HorizontalAlignment="Left"
+                                    Command="{Binding State.RestoreDefaultsCommand}">
+                                Restore default settings
+                            </Button>
+                        </StackPanel>
+                    </suki:GlassCard>
+                </StackPanel>
+            </ScrollViewer>
+        </TabItem>
+
+        <!-- Network & DNS -->
+        <TabItem Header="Network">
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <StackPanel Spacing="16" Margin="0,16,0,0">
+                    <suki:GlassCard Padding="18" CornerRadius="18">
+                        <StackPanel Spacing="14">
+                            <TextBlock Text="Bridges &amp; Censored Networks"
+                                       FontSize="16"
+                                       FontWeight="SemiBold" />
+
+                            <ToggleSwitch Content="Use Tor bridges (obfs4/snowflake/etc)"
+                                          IsChecked="{Binding State.UseTorBridges}" />
+
+                            <StackPanel Spacing="10"
+                                        IsVisible="{Binding State.UseTorBridges}">
+                                <StackPanel Spacing="6">
+                                    <TextBlock Text="Bridge type" Opacity="0.75" />
+                                    <ComboBox ItemsSource="{Binding State.BridgeTypes}"
+                                              SelectedItem="{Binding State.SelectedBridgeType}" />
+                                </StackPanel>
+
+                                <StackPanel Spacing="6">
+                                    <TextBlock Text="Custom bridges (optional, overrides built-in)" Opacity="0.75" />
+                                    <TextBox Text="{Binding State.CustomBridges}"
+                                             AcceptsReturn="True"
+                                             TextWrapping="Wrap"
+                                             MinHeight="140"
+                                             VerticalContentAlignment="Top"
+                                             Padding="10"
+                                             Watermark="Paste bridge lines from bridges.torproject.org..." />
+                                </StackPanel>
+
+                                <StackPanel Spacing="6">
+                                    <TextBlock Text="Custom SNI/front hosts (optional)" Opacity="0.75" />
+                                    <TextBox Text="{Binding State.CustomSniHosts}"
+                                             VerticalContentAlignment="Center"
+                                             Watermark="example.com, another.example" />
+                                </StackPanel>
+
+                                <StackPanel Spacing="10"
+                                            IsVisible="{Binding State.IsSnowflakeBridgeSelected}">
+                                    <ToggleSwitch Content="Snowflake: Use AMP cache (for blocked networks)"
+                                                  IsChecked="{Binding State.UseSnowflakeAmp}" />
+
+                                    <StackPanel Spacing="6">
+                                        <TextBlock Text="AMP cache URL (optional)" Opacity="0.75" />
+                                        <TextBox Text="{Binding State.SnowflakeAmpCache}"
+                                                 IsEnabled="{Binding State.UseSnowflakeAmp}"
+                                                 VerticalContentAlignment="Center"
+                                                 Watermark="https://cdn.ampproject.org/" />
+                                    </StackPanel>
+                                </StackPanel>
+                            </StackPanel>
+
+                            <Separator Height="1" Margin="0,8" Opacity="0.1" />
+
+                            <ToggleSwitch Content="Secure DNS (DoH) in VPN mode"
+                                          IsChecked="{Binding State.UseCensoredMode}" />
+
+                            <StackPanel Spacing="14" IsVisible="{Binding State.UseCensoredMode}">
+                                <StackPanel Spacing="6">
+                                    <TextBlock Text="DNS Provider" Opacity="0.75" />
+                                    <ComboBox ItemsSource="{Binding State.DnsProviders}"
+                                              SelectedItem="{Binding State.SelectedDnsProvider}" />
+                                </StackPanel>
+
+                                <StackPanel Spacing="6">
+                                    <TextBlock Text="Custom DoH host / URL" Opacity="0.75" />
+                                    <TextBox Text="{Binding State.CustomDohHost}"
+                                             IsEnabled="{Binding State.IsCustomDoh}"
+                                             VerticalContentAlignment="Center"
+                                             Watermark="cloudflare-dns.com or https://dns.example:443" />
+                                </StackPanel>
+
+                                <StackPanel Spacing="6">
+                                    <TextBlock Text="Custom DoH path" Opacity="0.75" />
+                                    <TextBox Text="{Binding State.CustomDohPath}"
+                                             IsEnabled="{Binding State.IsCustomDoh}"
+                                             VerticalContentAlignment="Center"
+                                             Watermark="/dns-query" />
+                                </StackPanel>
+                            </StackPanel>
+                        </StackPanel>
+                    </suki:GlassCard>
+                </StackPanel>
+            </ScrollViewer>
+        </TabItem>
+
+        <!-- Advanced -->
+        <TabItem Header="Advanced">
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <StackPanel Spacing="16" Margin="0,16,0,0">
+                    <suki:GlassCard Padding="18" CornerRadius="18">
+                        <StackPanel Spacing="14">
+                            <TextBlock Text="Tor Advanced"
+                                       FontSize="16"
+                                       FontWeight="SemiBold" />
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Text="Entry node (optional)" Opacity="0.75" />
+                                <ComboBox ItemsSource="{Binding State.Locations}"
+                                          SelectedItem="{Binding State.SelectedEntryLocation}" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Text="IPv6 support" Opacity="0.75" />
+                                <ComboBox ItemsSource="{Binding State.TorOptionModes}"
+                                          SelectedItem="{Binding State.TorIpv6Mode}" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Text="Hardware acceleration" Opacity="0.75" />
+                                <ComboBox ItemsSource="{Binding State.TorOptionModes}"
+                                          SelectedItem="{Binding State.HardwareAccelerationMode}" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Text="Connection padding" Opacity="0.75" />
+                                <ComboBox ItemsSource="{Binding State.ConnectionPaddingModes}"
+                                          SelectedItem="{Binding State.ConnectionPaddingMode}" />
+                            </StackPanel>
+
+                            <TextBlock Text="Tip: restricting entry/exit nodes can reduce reliability and speed."
+                                       Opacity="0.75"
+                                       TextWrapping="Wrap" />
+                        </StackPanel>
+                    </suki:GlassCard>
+
+                    <suki:GlassCard Padding="18" CornerRadius="18">
+                        <StackPanel Spacing="14">
+                            <TextBlock Text="Split Tunneling (Hybrid mode)"
+                                       FontSize="16"
+                                       FontWeight="SemiBold" />
+
+                            <TextBlock Text="In Hybrid mode, you can choose which apps use Tor and which go direct. One process name per line (example: chrome.exe)."
+                                       Opacity="0.75"
+                                       TextWrapping="Wrap" />
+
+                            <StackPanel Spacing="10"
+                                        IsEnabled="{Binding State.CanConfigureSplitTunneling}">
+                                <ToggleSwitch Content="Route all web traffic (ports 80/443) through Tor"
+                                              IsChecked="{Binding State.HybridRouteAllWebTraffic}" />
+
+                                <ToggleSwitch Content="Block QUIC/UDP for Tor apps (prevents bypass leaks)"
+                                              IsChecked="{Binding State.HybridBlockQuicForTorApps}" />
+
+                                <StackPanel Spacing="6">
+                                    <TextBlock Text="Apps routed through Tor (Hybrid mode)" Opacity="0.75" />
+                                    <TextBox Text="{Binding State.HybridTorApps}"
+                                             AcceptsReturn="True"
+                                             TextWrapping="Wrap"
+                                             MinHeight="120"
+                                             VerticalContentAlignment="Top"
+                                             Padding="10"
+                                             Watermark="firefox.exe&#10;chrome.exe&#10;msedge.exe" />
+                                </StackPanel>
+
+                                <StackPanel Spacing="6">
+                                    <TextBlock Text="Apps bypassing Tor (optional)" Opacity="0.75" />
+                                    <TextBox Text="{Binding State.HybridBypassApps}"
+                                             AcceptsReturn="True"
+                                             TextWrapping="Wrap"
+                                             MinHeight="90"
+                                             VerticalContentAlignment="Top"
+                                             Padding="10"
+                                             Watermark="steam.exe&#10;discord.exe" />
+                                </StackPanel>
+                            </StackPanel>
+
+                            <TextBlock Text="Enable TUN/VPN mode + Hybrid routing on the Home page to use split tunneling."
+                                       Opacity="0.75"
+                                       TextWrapping="Wrap" />
+                        </StackPanel>
+                    </suki:GlassCard>
+                </StackPanel>
+            </ScrollViewer>
+        </TabItem>
+    </TabControl>
+</UserControl>

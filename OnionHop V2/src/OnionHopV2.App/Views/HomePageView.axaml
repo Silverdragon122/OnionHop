@@ -1,0 +1,202 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:suki="https://github.com/kikipoulet/SukiUI"
+             xmlns:vm="using:OnionHopV2.App.ViewModels"
+             mc:Ignorable="d"
+             d:DesignWidth="900"
+             d:DesignHeight="720"
+             x:Class="OnionHopV2.App.Views.HomePageView"
+             x:DataType="vm:HomePageViewModel">
+
+    <Grid Margin="24"
+          RowDefinitions="Auto,Auto,Auto,Auto,Auto"
+          RowSpacing="14">
+
+        <TextBlock Grid.Row="0"
+                   Text="Connection"
+                   FontSize="28"
+                   FontWeight="SemiBold" />
+
+        <suki:GlassCard Grid.Row="1" Padding="18" CornerRadius="18">
+            <Grid ColumnDefinitions="*,Auto"
+                  RowDefinitions="Auto,Auto,Auto"
+                  ColumnSpacing="18"
+                  RowSpacing="10">
+                <StackPanel Grid.Row="0" Grid.Column="0" Spacing="4">
+                    <TextBlock Text="{Binding State.ConnectionStatus}"
+                               FontSize="20"
+                               FontWeight="SemiBold" />
+                    <TextBlock Text="{Binding State.StatusMessage}"
+                               Opacity="0.85"
+                               TextWrapping="Wrap" />
+                </StackPanel>
+
+                <StackPanel Grid.Row="0"
+                            Grid.Column="1"
+                            HorizontalAlignment="Right"
+                            Spacing="2">
+                    <TextBlock Text="Current IP" Opacity="0.7" HorizontalAlignment="Right" />
+                    <TextBlock Text="{Binding State.CurrentIp}"
+                               FontSize="18"
+                               FontWeight="Bold"
+                               HorizontalAlignment="Right" />
+                </StackPanel>
+
+                <ProgressBar Grid.Row="1"
+                             Grid.ColumnSpan="2"
+                             Minimum="0"
+                             Maximum="1"
+                             Value="{Binding State.ConnectionProgress}"
+                             Height="10"
+                             IsVisible="{Binding State.IsBusy}" />
+
+                <Grid Grid.Row="2"
+                      Grid.ColumnSpan="2"
+                      ColumnDefinitions="Auto,*"
+                      ColumnSpacing="10"
+                      VerticalAlignment="Center"
+                      HorizontalAlignment="Stretch">
+                    <!-- Primary action (mutually exclusive) -->
+                    <Grid Grid.Column="0"
+                          VerticalAlignment="Center">
+                        <Button Classes="Accent"
+                                Width="150"
+                                Height="38"
+                                Margin="0,0,10,0"
+                                Command="{Binding State.ConnectCommand}"
+                                IsVisible="{Binding State.ShowConnectButton}">
+                            Connect
+                        </Button>
+                        <Button Classes="Danger"
+                                Width="150"
+                                Height="38"
+                                Margin="0,0,10,0"
+                                Command="{Binding State.DisconnectCommand}"
+                                IsVisible="{Binding State.ShowDisconnectButton}">
+                            Disconnect
+                        </Button>
+                        <Button Classes="Warning"
+                                Width="150"
+                                Height="38"
+                                Margin="0,0,10,0"
+                                Command="{Binding State.CancelConnectCommand}"
+                                IsVisible="{Binding State.ShowCancelButton}">
+                            Cancel
+                        </Button>
+                    </Grid>
+
+                    <!-- Secondary actions -->
+                    <StackPanel Grid.Column="1"
+                                Orientation="Horizontal"
+                                Spacing="10"
+                                HorizontalAlignment="Right"
+                                VerticalAlignment="Center">
+                        <Button Classes="Flat"
+                                Width="150"
+                                Height="38"
+                                Command="{Binding State.RefreshIpCommand}">
+                            Refresh IP
+                        </Button>
+                        <Button Classes="Flat"
+                                Width="150"
+                                Height="38"
+                                Command="{Binding State.ChangeIdentityCommand}">
+                            New Identity
+                        </Button>
+                    </StackPanel>
+                </Grid>
+            </Grid>
+        </suki:GlassCard>
+
+        <Grid Grid.Row="2"
+              ColumnDefinitions="*,*"
+              ColumnSpacing="14">
+            <suki:GlassCard Grid.Column="0" Padding="16" CornerRadius="18">
+                <StackPanel Spacing="10">
+                    <TextBlock Text="Routing"
+                               FontSize="16"
+                               FontWeight="SemiBold" />
+
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="Mode" Opacity="0.75" />
+                        <ComboBox ItemsSource="{Binding State.ConnectionModes}"
+                                  SelectedItem="{Binding State.SelectedConnectionMode}" />
+                    </StackPanel>
+
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="Exit Location" Opacity="0.75" />
+                        <ComboBox ItemsSource="{Binding State.Locations}"
+                                  SelectedItem="{Binding State.SelectedLocation}" />
+                    </StackPanel>
+                </StackPanel>
+            </suki:GlassCard>
+
+            <suki:GlassCard Grid.Column="1" Padding="16" CornerRadius="18">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="Tor Network"
+                               FontSize="16"
+                               FontWeight="SemiBold" />
+
+                    <Grid ColumnDefinitions="Auto,*"
+                          RowDefinitions="Auto,Auto"
+                          ColumnSpacing="10"
+                          RowSpacing="10">
+                        <TextBlock Grid.Row="0" Grid.Column="0" Text="↓" FontSize="16" FontWeight="Bold" Opacity="0.9" />
+                        <StackPanel Grid.Row="0" Grid.Column="1" Spacing="6">
+                            <TextBlock Text="{Binding State.DownloadSpeed}" FontSize="16" FontWeight="SemiBold" />
+                            <ProgressBar Minimum="0" Maximum="1" Value="{Binding State.DownloadSpeedGauge}" Height="8" />
+                        </StackPanel>
+
+                        <TextBlock Grid.Row="1" Grid.Column="0" Text="↑" FontSize="16" FontWeight="Bold" Opacity="0.9" />
+                        <StackPanel Grid.Row="1" Grid.Column="1" Spacing="6">
+                            <TextBlock Text="{Binding State.UploadSpeed}" FontSize="16" FontWeight="SemiBold" />
+                            <ProgressBar Minimum="0" Maximum="1" Value="{Binding State.UploadSpeedGauge}" Height="8" />
+                        </StackPanel>
+                    </Grid>
+
+                    <TextBlock Text="Shows Tor's own traffic (from the control port)."
+                               Opacity="0.75"
+                               TextWrapping="Wrap" />
+                </StackPanel>
+            </suki:GlassCard>
+        </Grid>
+
+        <suki:GlassCard Grid.Row="3" Padding="16" CornerRadius="18" IsVisible="{Binding State.IsTunMode}">
+            <StackPanel Spacing="12">
+                <TextBlock Text="TUN/VPN Options"
+                           FontSize="16"
+                           FontWeight="SemiBold" />
+
+                <ToggleSwitch Content="Hybrid routing (split tunneling)"
+                              IsChecked="{Binding State.UseHybridRouting}" />
+
+                <ToggleSwitch Content="Kill switch (strict TUN only)"
+                              IsChecked="{Binding State.KillSwitchEnabled}"
+                              IsEnabled="{Binding State.CanUseKillSwitch}" />
+
+                <TextBlock Text="Kill switch requires Administrator and is disabled in Hybrid mode."
+                           Opacity="0.75"
+                           TextWrapping="Wrap" />
+            </StackPanel>
+        </suki:GlassCard>
+
+        <suki:GlassCard Grid.Row="4"
+                        Padding="16"
+                        CornerRadius="18"
+                        IsVisible="{Binding State.IsDependencyDownloadInProgress}">
+            <StackPanel Spacing="10">
+                <TextBlock Text="Downloading components..."
+                           FontSize="16"
+                           FontWeight="SemiBold" />
+                <TextBlock Text="{Binding State.DependencyDownloadStatus}"
+                           Opacity="0.85"
+                           TextWrapping="Wrap" />
+                <ProgressBar Minimum="0"
+                             Maximum="1"
+                             Value="{Binding State.DependencyDownloadProgress}" />
+            </StackPanel>
+        </suki:GlassCard>
+    </Grid>
+</UserControl>

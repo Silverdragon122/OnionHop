@@ -1,0 +1,1147 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+using OnionHopV2.Core.Dependencies;
+using OnionHopV2.Core.Networking;
+using OnionHopV2.Core.Platform.Windows;
+using OnionHopV2.Core.Services;
+using OnionHopV2.Core.Tor;
+
+namespace OnionHopV2.Core;
+
+public sealed class OnionHopClient : IDisposable
+{
+    private static readonly Regex AnsiEscapeRegex = new(@"\x1B\[[0-?]*[ -/]*[@-~]", RegexOptions.Compiled);
+    private static readonly Regex SingBoxConnectionToRegex = new(@"connection to (?<dest>\S+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    public const int SocksPort = 9050;
+
+    public readonly record struct StatusUpdate(
+        bool IsConnecting,
+        bool IsConnected,
+        bool IsDisconnecting,
+        string ConnectionStatus,
+        string StatusMessage,
+        double ConnectionProgress,
+        string CurrentIp);
+
+    public readonly record struct DependencyUpdate(bool InProgress, string Status, double Progress);
+
+    public event EventHandler<string>? Log;
+    public event EventHandler<string>? DnsLog;
+    public event EventHandler<StatusUpdate>? StatusUpdated;
+    public event EventHandler<DependencyUpdate>? DependencyUpdated;
+
+    private readonly string _baseDir;
+    private readonly DependencyManager _deps = new();
+    private readonly TorBridgeManager _bridgeManager;
+    private readonly WindowsProxyService _proxyService = new();
+
+    private readonly TorService _torService;
+    private readonly VpnService _vpnService;
+    private readonly AdminHelperClient _adminHelper = new();
+
+    private Task<bool>? _dependencyEnsureTask;
+    private PluggableTransportConfig? _ptConfig;
+
+    private TaskCompletionSource<bool>? _bootstrapSource;
+
+    private bool _isConnecting;
+    private bool _isConnected;
+    private bool _isDisconnecting;
+    private string _connectionStatus = "Disconnected";
+    private string _statusMessage = "Ready to route traffic through Tor.";
+    private double _connectionProgress;
+    private string _currentIp = "--.--.--.--";
+
+    private bool _dependencyDownloadInProgress;
+    private string _dependencyDownloadStatus = "Checking components...";
+    private double _dependencyDownloadProgress;
+
+    private DateTime _lastNewnymUtc = DateTime.MinValue;
+    private OnionHopConnectOptions? _activeOptions;
+
+    private readonly object _singBoxLogLock = new();
+    private readonly Queue<string> _singBoxRecentLines = new();
+    private DateTime _lastVpnMessageUtc = DateTime.MinValue;
+    private CancellationTokenSource? _adminVpnMonitorCts;
+
+    public OnionHopClient(string? baseDirectory = null)
+    {
+        _baseDir = string.IsNullOrWhiteSpace(baseDirectory) ? AppContext.BaseDirectory : baseDirectory!;
+        _bridgeManager = new TorBridgeManager(_baseDir);
+
+        _torService = new TorService(RaiseLog);
+        _vpnService = new VpnService(RaiseLog);
+
+        _torService.OutputReceived += OnTorDataReceived;
+        _torService.Exited += OnTorExited;
+
+        _vpnService.OutputReceived += OnSingBoxDataReceived;
+        _vpnService.Exited += OnSingBoxExited;
+    }
+
+    public string BaseDirectory => _baseDir;
+
+    public IReadOnlyList<string> GetBridgeTypes()
+    {
+        return TorBridgeManager.GetBridgeTypeKeys(_ptConfig);
+    }
+
+    public string? GetRecommendedBridgeType()
+    {
+        return _ptConfig?.RecommendedDefault;
+    }
+
+    public async Task<(long BytesRead, long BytesWritten)?> TryGetTorTrafficBytesAsync(CancellationToken token = default)
+    {
+        try
+        {
+            if (!_torService.IsRunning)
+            {
+                return null;
+            }
+
+            return await _torService.TryGetTrafficBytesAsync(token).ConfigureAwait(false);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public async Task<bool> EnsureDependenciesAsync(CancellationToken token = default)
+    {
+        return await (_dependencyEnsureTask ??= EnsureDependenciesCoreAsync(token)).ConfigureAwait(false);
+    }
+
+    public async Task<bool> EnsureAdminHelperAsync()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+
+        try
+        {
+            StartupLogger.Write("OnionHopClient.EnsureAdminHelperAsync: calling _adminHelper.EnsureConnectedAsync...");
+            var result = await _adminHelper.EnsureConnectedAsync().ConfigureAwait(false);
+            StartupLogger.Write($"OnionHopClient.EnsureAdminHelperAsync: _adminHelper.EnsureConnectedAsync returned {result}");
+            return result;
+        }
+        catch (Exception ex)
+        {
+            StartupLogger.Write($"OnionHopClient.EnsureAdminHelperAsync EXCEPTION: {ex.GetType().Name}: {ex.Message}");
+            RaiseLog($"EnsureAdminHelperAsync failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    public async Task ConnectAsync(OnionHopConnectOptions options, CancellationToken token)
+    {
+        StartupLogger.Write("OnionHopClient.ConnectAsync: Starting...");
+        
+        if (_isConnecting)
+        {
+            StartupLogger.Write("OnionHopClient.ConnectAsync: Already connecting, returning");
+            return;
+        }
+
+        if (_isConnected)
+        {
+            StartupLogger.Write("OnionHopClient.ConnectAsync: Already connected, disconnecting first");
+            await DisconnectAsync().ConfigureAwait(false);
+            return;
+        }
+
+        if (!OperatingSystem.IsWindows())
+        {
+            StartupLogger.Write("OnionHopClient.ConnectAsync: Not Windows");
+            SetStatus(
+                isConnecting: false,
+                isConnected: false,
+                isDisconnecting: false,
+                connectionStatus: "Unavailable",
+                statusMessage: "Windows-only for now. Linux/macOS integration will be added later.",
+                progress: 0);
+            return;
+        }
+
+        StartupLogger.Write("OnionHopClient.ConnectAsync: Checking dependencies...");
+        if (!await EnsureDependenciesAsync(token).ConfigureAwait(false))
+        {
+            StartupLogger.Write("OnionHopClient.ConnectAsync: Dependencies check failed!");
+            SetStatus(
+                isConnecting: false,
+                isConnected: false,
+                isDisconnecting: false,
+                connectionStatus: "Disconnected",
+                statusMessage: "Failed to verify or download required components.",
+                progress: 0);
+            return;
+        }
+        StartupLogger.Write("OnionHopClient.ConnectAsync: Dependencies OK");
+
+        var connectTimeout = options.UseTorBridges ? TimeSpan.FromSeconds(240) : TimeSpan.FromSeconds(60);
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+        timeoutCts.CancelAfter(connectTimeout);
+
+        _activeOptions = options;
+        SetStatus(
+            isConnecting: true,
+            isConnected: false,
+            isDisconnecting: false,
+            connectionStatus: "Connecting...",
+            statusMessage: "Starting Tor and bootstrapping network...",
+            progress: 0.1);
+
+        _currentIp = "Resolving...";
+        PublishStatus();
+
+        try
+        {
+            RaiseLog($"Connecting. Mode={options.SelectedConnectionMode}, Hybrid={options.UseHybridRouting}, Exit={options.SelectedLocation}, Bridges={(options.UseTorBridges ? options.SelectedBridgeType : "off")}");
+
+            await StartTorAsync(options, timeoutCts.Token).ConfigureAwait(false);
+
+            if (IsTunMode(options))
+            {
+                _connectionProgress = Math.Max(_connectionProgress, 0.9);
+                _statusMessage = options.UseHybridRouting
+                    ? "Tor is running. Starting Hybrid tunnel (web via Tor)..."
+                    : "Tor is running. Starting VPN tunnel (all traffic via Tor)...";
+                PublishStatus();
+
+                await StartSingBoxVpnAsync(options, timeoutCts.Token).ConfigureAwait(false);
+            }
+            else
+            {
+                _proxyService.ApplyTorSocksProxy(SocksPort, RaiseLog);
+            }
+
+            _isConnected = true;
+            _connectionStatus = "Connected";
+            _connectionProgress = 1;
+            _statusMessage = IsTunMode(options)
+                ? (options.UseHybridRouting
+                    ? "Tor is running. Hybrid routing is active (browser via Tor)."
+                    : "Tor is running. VPN tunnel is active (all traffic via Tor).")
+                : "Tor is running. Proxy mode is active (apps must respect proxy settings).";
+            PublishStatus();
+
+            await RefreshIpAsync(updateStatusMessage: false, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            RaiseLog("Connect canceled or timed out.");
+            await DisconnectCoreAsync(disableStatusUpdate: true).ConfigureAwait(false);
+            SetStatus(
+                isConnecting: false,
+                isConnected: false,
+                isDisconnecting: false,
+                connectionStatus: "Disconnected",
+                statusMessage: "Connection canceled or timed out.",
+                progress: 0);
+        }
+        catch (Exception ex)
+        {
+            RaiseLog($"Connect failed: {ex.Message}");
+            await DisconnectCoreAsync(disableStatusUpdate: true).ConfigureAwait(false);
+            SetStatus(
+                isConnecting: false,
+                isConnected: false,
+                isDisconnecting: false,
+                connectionStatus: "Disconnected",
+                statusMessage: $"Failed to connect: {ex.Message}",
+                progress: 0);
+        }
+        finally
+        {
+            _isConnecting = false;
+            PublishStatus();
+        }
+    }
+
+    public async Task DisconnectAsync()
+    {
+        if (_isConnecting)
+        {
+            return;
+        }
+
+        if (!_isConnected && !_torService.IsRunning)
+        {
+            return;
+        }
+
+        _isDisconnecting = true;
+        SetStatus(
+            isConnecting: false,
+            isConnected: _isConnected,
+            isDisconnecting: true,
+            connectionStatus: "Disconnecting...",
+            statusMessage: "Stopping Tor...",
+            progress: 0.2);
+
+        await DisconnectCoreAsync(disableStatusUpdate: false).ConfigureAwait(false);
+    }
+
+    public async Task RefreshIpAsync(bool updateStatusMessage, CancellationToken token)
+    {
+        var torFirst = _isConnected && _torService.IsRunning;
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+        cts.CancelAfter(TimeSpan.FromSeconds(18));
+
+        try
+        {
+            string? ip = null;
+
+            if (torFirst)
+            {
+                ip = await IpLookupService.TryFetchTorExitIpAsync(SocksPort, RaiseLog, cts.Token).ConfigureAwait(false);
+                if (!string.IsNullOrWhiteSpace(ip))
+                {
+                    _currentIp = ip;
+                    if (updateStatusMessage)
+                    {
+                        _statusMessage = "Tor exit IP refreshed.";
+                    }
+                    PublishStatus();
+                    return;
+                }
+            }
+
+            ip = await IpLookupService.TryFetchDirectIpAsync(RaiseLog, cts.Token).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(ip))
+            {
+                _currentIp = ip;
+                if (updateStatusMessage)
+                {
+                    _statusMessage = torFirst
+                        ? "Tor IP lookup failed. Showing direct IP."
+                        : "Direct IP refreshed.";
+                }
+                PublishStatus();
+                return;
+            }
+
+            _currentIp = "--.--.--.--";
+            if (updateStatusMessage)
+            {
+                _statusMessage = "Unable to fetch IP.";
+            }
+            PublishStatus();
+        }
+        catch (OperationCanceledException)
+        {
+            _currentIp = "--.--.--.--";
+            if (updateStatusMessage)
+            {
+                _statusMessage = "IP lookup timed out.";
+            }
+            PublishStatus();
+        }
+    }
+
+    public async Task ChangeIdentityAsync(CancellationToken token)
+    {
+        if (!_isConnected || !_torService.IsRunning)
+        {
+            _statusMessage = "Connect to Tor before requesting a new identity.";
+            PublishStatus();
+            return;
+        }
+
+        if (DateTime.UtcNow - _lastNewnymUtc < TimeSpan.FromSeconds(10))
+        {
+            _statusMessage = "Please wait a moment before requesting another identity.";
+            PublishStatus();
+            return;
+        }
+
+        _statusMessage = "Requesting a new Tor circuit...";
+        PublishStatus();
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+        cts.CancelAfter(TimeSpan.FromSeconds(8));
+        var success = await _torService.SendControlSignalAsync("SIGNAL NEWNYM", cts.Token).ConfigureAwait(false);
+        if (!success)
+        {
+            _statusMessage = "Unable to request a new identity. Check Tor is running.";
+            PublishStatus();
+            return;
+        }
+
+        _lastNewnymUtc = DateTime.UtcNow;
+        await Task.Delay(1200, token).ConfigureAwait(false);
+        await RefreshIpAsync(updateStatusMessage: true, token).ConfigureAwait(false);
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            _adminVpnMonitorCts?.Cancel();
+            _adminVpnMonitorCts = null;
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            if (_proxyService.IsApplied)
+            {
+                _proxyService.RestorePreviousProxy(RaiseLog);
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            StopSingBoxProcess();
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            StopTorProcess();
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            if (_adminHelper.IsConnected)
+            {
+                _adminHelper.ShutdownIfConnectedAsync().Wait(TimeSpan.FromSeconds(2));
+            }
+        }
+        catch
+        {
+        }
+
+        _adminHelper.Dispose();
+        _vpnService.Dispose();
+        _torService.Dispose();
+    }
+
+    private async Task<bool> EnsureDependenciesCoreAsync(CancellationToken token)
+    {
+        StartupLogger.Write("EnsureDependenciesCoreAsync: Starting dependency check...");
+        
+        void Progress(DependencyManager.DependencyUpdate update)
+        {
+            _dependencyDownloadInProgress = update.InProgress;
+            _dependencyDownloadStatus = update.Status;
+            _dependencyDownloadProgress = update.Progress;
+            PublishDependency();
+        }
+
+        var success = await _deps.EnsureAsync(_baseDir, Progress, RaiseLog, token).ConfigureAwait(false);
+        StartupLogger.Write($"EnsureDependenciesCoreAsync: _deps.EnsureAsync returned {success}");
+        if (!success)
+        {
+            return false;
+        }
+
+        _ptConfig = DependencyManager.TryLoadPluggableTransportConfig(_baseDir, RaiseLog);
+        return true;
+    }
+
+    private async Task DisconnectCoreAsync(bool disableStatusUpdate)
+    {
+        try
+        {
+            StopSingBoxProcess();
+
+            if (KillSwitchService.IsEmergencyBlockActive())
+            {
+                if (WindowsAdmin.IsAdministrator())
+                {
+                    KillSwitchService.DisableEmergencyBlock(RaiseLog);
+                }
+                else
+                {
+                    _ = Task.Run(async () => await _adminHelper.DisableKillSwitchIfAvailableAsync().ConfigureAwait(false));
+                }
+            }
+
+            if (_proxyService.IsApplied)
+            {
+                _proxyService.RestorePreviousProxy(RaiseLog);
+            }
+
+            StopTorProcess();
+            await Task.Delay(250).ConfigureAwait(false);
+        }
+        finally
+        {
+            _activeOptions = null;
+            _isConnected = false;
+            _isDisconnecting = false;
+            _connectionStatus = "Disconnected";
+            _connectionProgress = 0;
+
+            if (!disableStatusUpdate)
+            {
+                _statusMessage = "Tor stopped. Traffic is back to normal.";
+                _currentIp = "Resolving...";
+            }
+
+            PublishStatus();
+
+            if (!disableStatusUpdate)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await RefreshIpAsync(updateStatusMessage: false, CancellationToken.None).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                    }
+                });
+            }
+        }
+    }
+
+    private void PublishStatus()
+    {
+        StatusUpdated?.Invoke(this, new StatusUpdate(
+            IsConnecting: _isConnecting,
+            IsConnected: _isConnected,
+            IsDisconnecting: _isDisconnecting,
+            ConnectionStatus: _connectionStatus,
+            StatusMessage: _statusMessage,
+            ConnectionProgress: _connectionProgress,
+            CurrentIp: _currentIp));
+    }
+
+    private void PublishDependency()
+    {
+        DependencyUpdated?.Invoke(this, new DependencyUpdate(_dependencyDownloadInProgress, _dependencyDownloadStatus, _dependencyDownloadProgress));
+    }
+
+    private void SetStatus(bool isConnecting, bool isConnected, bool isDisconnecting, string connectionStatus, string statusMessage, double progress)
+    {
+        _isConnecting = isConnecting;
+        _isConnected = isConnected;
+        _isDisconnecting = isDisconnecting;
+        _connectionStatus = connectionStatus;
+        _statusMessage = statusMessage;
+        _connectionProgress = progress;
+        PublishStatus();
+    }
+
+    private static bool IsTunMode(OnionHopConnectOptions options)
+    {
+        return string.Equals(options.SelectedConnectionMode, OnionHopConnectOptions.ConnectionModeTun, StringComparison.Ordinal);
+    }
+
+    private void RaiseLog(string message)
+    {
+        Log?.Invoke(this, message);
+    }
+
+    private void RaiseDnsLog(string message)
+    {
+        DnsLog?.Invoke(this, message);
+    }
+
+    private async Task StartTorAsync(OnionHopConnectOptions options, CancellationToken token)
+    {
+        _bootstrapSource = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var registration = token.Register(() => _bootstrapSource.TrySetCanceled(token));
+
+        var torDir = Path.Combine(_baseDir, "tor");
+        var torPath = Path.Combine(torDir, "tor.exe");
+        var geoIpPath = Path.Combine(torDir, "geoip");
+        var geoIp6Path = Path.Combine(torDir, "geoip6");
+
+        IReadOnlyList<string>? bridgeLines = null;
+        List<string>? normalizedPlugins = null;
+        if (options.UseTorBridges)
+        {
+            bridgeLines = await _bridgeManager.GetBridgeLinesAsync(options, _ptConfig, RaiseLog, token).ConfigureAwait(false);
+            if (bridgeLines.Count == 0)
+            {
+                var message = _bridgeManager.BridgeValidationMessage;
+                if (string.IsNullOrWhiteSpace(message))
+                {
+                    message = "Bridges enabled but no bridge lines are configured.";
+                }
+                throw new InvalidOperationException(message);
+            }
+
+            var pluginLines = _bridgeManager.GetClientTransportPlugins(options, bridgeLines, torDir, _ptConfig, RaiseLog);
+            if (pluginLines.Count == 0)
+            {
+                var message = _bridgeManager.BridgeValidationMessage;
+                if (string.IsNullOrWhiteSpace(message))
+                {
+                    message = "Bridges enabled but no transport plugins were found.";
+                }
+                throw new InvalidOperationException(message);
+            }
+
+            normalizedPlugins = pluginLines
+                .Select(TorBridgeManager.NormalizeClientTransportPlugin)
+                .Where(normalized => !string.IsNullOrWhiteSpace(normalized))
+                .ToList();
+        }
+
+        var countryCode = GetCountryCode(options.SelectedLocation);
+        var entryCode = GetCountryCode(options.SelectedEntryLocation);
+        var config = new TorLaunchConfig
+        {
+            TorPath = torPath,
+            SocksPort = SocksPort,
+            GeoIpPath = geoIpPath,
+            GeoIp6Path = geoIp6Path,
+            BridgeLines = bridgeLines,
+            ClientTransportPlugins = normalizedPlugins,
+            ExitCountryCode = countryCode,
+            EntryCountryCode = entryCode,
+            ClientUseIpv6 = ParseToggleMode(options.TorIpv6Mode),
+            HardwareAccel = ParseToggleMode(options.HardwareAccelerationMode),
+            ConnectionPadding = ParseConnectionPaddingMode(options.ConnectionPaddingMode)
+        };
+
+        await _torService.StartAsync(config, token).ConfigureAwait(false);
+        await _bootstrapSource.Task.ConfigureAwait(false);
+    }
+
+    private async Task StartSingBoxVpnAsync(OnionHopConnectOptions options, CancellationToken token)
+    {
+        RaiseLog("StartSingBoxVpnAsync: Starting VPN setup...");
+        StopSingBoxProcess();
+
+        var vpnDir = Path.Combine(_baseDir, "vpn");
+        var singBoxPath = Path.Combine(vpnDir, "sing-box.exe");
+        var wintunPath = Path.Combine(vpnDir, "wintun.dll");
+        var doh = DohSettingsResolver.Resolve(options);
+        var config = new VpnLaunchConfig
+        {
+            SingBoxPath = singBoxPath,
+            WintunPath = wintunPath,
+            HybridRouting = options.UseHybridRouting,
+            SecureDns = options.UseCensoredMode,
+            SocksPort = SocksPort,
+            DohServer = doh.Server,
+            DohServerPort = doh.Port,
+            DohPath = doh.Path,
+            TorAppProcessNames = ResolveHybridTorApps(options),
+            BypassAppProcessNames = ParseProcessNames(options.HybridBypassApps),
+            RouteAllWebTrafficThroughTor = options.HybridRouteAllWebTraffic,
+            BlockQuicForTorApps = options.HybridBlockQuicForTorApps
+        };
+
+        RaiseLog($"StartSingBoxVpnAsync: IsAdmin={WindowsAdmin.IsAdministrator()}, SingBoxPath={singBoxPath}");
+
+        if (!WindowsAdmin.IsAdministrator())
+        {
+            RaiseLog("StartSingBoxVpnAsync: Calling TryStartVpnAsync via admin helper...");
+            var result = await _adminHelper.TryStartVpnAsync(config).ConfigureAwait(false);
+            RaiseLog($"StartSingBoxVpnAsync: TryStartVpnAsync returned Success={result.Success}, Error={result.Error ?? "none"}");
+            if (!result.Success)
+            {
+                var drained = await _adminHelper.DrainLogsAsync().ConfigureAwait(false);
+                foreach (var logLine in drained)
+                {
+                    ProcessSingBoxLogLine(logLine);
+                }
+
+                var lastLines = string.Join("\n", drained.Count > 8
+                    ? drained.Skip(Math.Max(0, drained.Count - 8))
+                    : drained);
+
+                var details = string.IsNullOrWhiteSpace(result.Error) ? "Unknown error." : result.Error;
+                if (!string.IsNullOrWhiteSpace(lastLines))
+                {
+                    details += "\nLast logs:\n" + lastLines;
+                }
+
+                throw new InvalidOperationException($"Unable to start elevated VPN helper: {details}");
+            }
+
+            StartAdminVpnMonitor(options);
+            return;
+        }
+
+        await _vpnService.StartAsync(config, token).ConfigureAwait(false);
+    }
+
+    private static readonly string[] BrowserProcessNames =
+    [
+        "firefox.exe",
+        "chrome.exe",
+        "msedge.exe"
+    ];
+
+    private static IReadOnlyList<string> ResolveHybridTorApps(OnionHopConnectOptions options)
+    {
+        var apps = new List<string>(BrowserProcessNames);
+        apps.AddRange(ParseProcessNames(options.HybridTorApps));
+
+        return apps
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static IReadOnlyList<string> ParseProcessNames(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return Array.Empty<string>();
+        }
+
+        var results = new List<string>();
+        using var reader = new StringReader(text);
+        string? line;
+        while ((line = reader.ReadLine()) != null)
+        {
+            line = line.Trim();
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            if (line.StartsWith("#", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            foreach (var token in line.Split(new[] { ',', ';', '\t', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                var name = token.Trim().Trim('"');
+                if (string.IsNullOrWhiteSpace(name))
+                {
+                    continue;
+                }
+
+                if (name.Contains('\\') || name.Contains('/'))
+                {
+                    name = Path.GetFileName(name);
+                }
+
+                if (!string.IsNullOrWhiteSpace(name))
+                {
+                    results.Add(name);
+                }
+            }
+        }
+
+        return results
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static bool? ParseToggleMode(string? mode)
+    {
+        if (string.IsNullOrWhiteSpace(mode))
+        {
+            return null;
+        }
+
+        if (string.Equals(mode, OnionHopConnectOptions.ToggleModeEnabled, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (string.Equals(mode, OnionHopConnectOptions.ToggleModeDisabled, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return null;
+    }
+
+    private static string? ParseConnectionPaddingMode(string? mode)
+    {
+        if (string.IsNullOrWhiteSpace(mode))
+        {
+            return null;
+        }
+
+        if (string.Equals(mode, OnionHopConnectOptions.ConnectionPaddingAuto, StringComparison.OrdinalIgnoreCase))
+        {
+            return "auto";
+        }
+
+        if (string.Equals(mode, OnionHopConnectOptions.ConnectionPaddingEnabled, StringComparison.OrdinalIgnoreCase))
+        {
+            return "1";
+        }
+
+        if (string.Equals(mode, OnionHopConnectOptions.ConnectionPaddingDisabled, StringComparison.OrdinalIgnoreCase))
+        {
+            return "0";
+        }
+
+        return null;
+    }
+
+    private void StartAdminVpnMonitor(OnionHopConnectOptions options)
+    {
+        _adminVpnMonitorCts?.Cancel();
+        _adminVpnMonitorCts = new CancellationTokenSource();
+        var token = _adminVpnMonitorCts.Token;
+
+        _ = Task.Run(async () =>
+        {
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(3000, token).ConfigureAwait(false);
+                    var status = await _adminHelper.GetStatusAsync().ConfigureAwait(false);
+                    if (status == null)
+                    {
+                        RaiseLog("VPN helper unavailable. Disconnecting...");
+                        _connectionStatus = "VPN stopped";
+                        _statusMessage = "VPN helper unavailable. Disconnecting...";
+                        PublishStatus();
+                        await DisconnectAsync().ConfigureAwait(false);
+                        return;
+                    }
+
+                    var logLines = await _adminHelper.DrainLogsAsync().ConfigureAwait(false);
+                    foreach (var logLine in logLines)
+                    {
+                        ProcessSingBoxLogLine(logLine);
+                    }
+
+                    if (status.VpnRunning)
+                    {
+                        continue;
+                    }
+
+                    if (_isDisconnecting || !_isConnected || !IsTunMode(options))
+                    {
+                        return;
+                    }
+
+                    if (options.KillSwitchEnabled && !options.UseHybridRouting)
+                    {
+                        await _adminHelper.EnableKillSwitchAsync().ConfigureAwait(false);
+                    }
+
+                    RaiseLog($"VPN helper reports tunnel stopped (exit code {status.VpnExitCode?.ToString() ?? "unknown"}). Disconnecting...");
+                    _connectionStatus = "VPN stopped";
+                    _statusMessage = "VPN tunnel stopped unexpectedly. Disconnecting...";
+                    PublishStatus();
+                    await DisconnectAsync().ConfigureAwait(false);
+                    return;
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    RaiseLog($"VPN helper monitor failed: {ex.Message}");
+                }
+            }
+        }, token);
+    }
+
+    private void OnTorExited(object? sender, EventArgs e)
+    {
+        if (_isDisconnecting)
+        {
+            return;
+        }
+
+        var exitCode = _torService.ExitCode ?? 0;
+        RaiseLog($"Tor exited with code {exitCode}.");
+
+        // If Tor dies while we're connecting, fail fast instead of waiting for the connect timeout.
+        if (_isConnecting)
+        {
+            _bootstrapSource?.TrySetException(new InvalidOperationException($"Tor exited with code {exitCode}."));
+            return;
+        }
+
+        if (_isConnected)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    _connectionStatus = "Tor stopped";
+                    _statusMessage = $"Tor stopped unexpectedly (exit code {exitCode}). Disconnecting...";
+                    _connectionProgress = 0;
+                    PublishStatus();
+                    await DisconnectAsync().ConfigureAwait(false);
+                }
+                catch
+                {
+                }
+            });
+        }
+    }
+
+    private void OnTorDataReceived(object? sender, DataReceivedEventArgs e)
+    {
+        if (string.IsNullOrWhiteSpace(e.Data))
+        {
+            return;
+        }
+
+        var line = e.Data;
+        if (line.Contains("Bootstrapped", StringComparison.OrdinalIgnoreCase))
+        {
+            var percent = ExtractProgress(line);
+            _connectionProgress = percent / 100d;
+            if (_isConnecting)
+            {
+                var summary = ExtractBootstrapSummary(line);
+                if (!string.IsNullOrWhiteSpace(summary))
+                {
+                    _statusMessage = summary;
+                }
+            }
+
+            PublishStatus();
+            if (percent >= 100)
+            {
+                _bootstrapSource?.TrySetResult(true);
+            }
+
+            return;
+        }
+
+        if (IsFatalTorBootstrapLine(line))
+        {
+            _bootstrapSource?.TrySetException(new InvalidOperationException(line));
+            return;
+        }
+
+        if (ShouldLogTorLine(line))
+        {
+            RaiseLog($"Tor log: {line}");
+        }
+    }
+
+    private void OnSingBoxDataReceived(object sender, DataReceivedEventArgs e)
+    {
+        ProcessSingBoxLogLine(e.Data);
+    }
+
+    private void ProcessSingBoxLogLine(string? data)
+    {
+        if (string.IsNullOrWhiteSpace(data))
+        {
+            return;
+        }
+
+        var line = AnsiEscapeRegex.Replace(data, string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return;
+        }
+
+        RaiseLog($"sing-box: {line}");
+        if (LooksLikeDnsLogLine(line))
+        {
+            RaiseDnsLog($"sing-box: {line}");
+        }
+
+        lock (_singBoxLogLock)
+        {
+            _singBoxRecentLines.Enqueue(line);
+            while (_singBoxRecentLines.Count > 40)
+            {
+                _singBoxRecentLines.Dequeue();
+            }
+        }
+
+        if (line.Contains("socks5: request rejected", StringComparison.OrdinalIgnoreCase))
+        {
+            var destMatch = SingBoxConnectionToRegex.Match(line);
+            var dest = destMatch.Success ? destMatch.Groups["dest"].Value : "a destination";
+            var now = DateTime.UtcNow;
+            if (now - _lastVpnMessageUtc >= TimeSpan.FromSeconds(10))
+            {
+                _lastVpnMessageUtc = now;
+                _statusMessage = $"VPN tunnel: Tor rejected a connection to {dest}. Non-web ports are often blocked by Tor exits.";
+                PublishStatus();
+            }
+        }
+    }
+
+    private void OnSingBoxExited(object? sender, EventArgs e)
+    {
+        var exitCode = _vpnService.ExitCode ?? 0;
+        RaiseLog($"sing-box exited with code {exitCode}.");
+
+        if (_isConnected && _activeOptions is { } options && IsTunMode(options) && options.KillSwitchEnabled && !options.UseHybridRouting && !_isDisconnecting)
+        {
+            if (WindowsAdmin.IsAdministrator())
+            {
+                KillSwitchService.EnableEmergencyBlock(RaiseLog);
+            }
+            else
+            {
+                _ = Task.Run(async () =>
+                {
+                    if (await _adminHelper.EnsureConnectedAsync().ConfigureAwait(false))
+                    {
+                        await _adminHelper.EnableKillSwitchAsync().ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        RaiseLog("Kill switch could not be enabled (admin helper unavailable).");
+                    }
+                });
+            }
+        }
+
+        if (_isConnected && !_isDisconnecting)
+        {
+            string lastLines;
+            lock (_singBoxLogLock)
+            {
+                lastLines = string.Join("\n", _singBoxRecentLines.Count > 6
+                    ? _singBoxRecentLines.Skip(Math.Max(0, _singBoxRecentLines.Count - 6))
+                    : _singBoxRecentLines);
+            }
+
+            _connectionStatus = "VPN stopped";
+            _statusMessage = string.IsNullOrWhiteSpace(lastLines)
+                ? $"VPN tunnel stopped unexpectedly (exit code {exitCode}). Disconnecting..."
+                : $"VPN tunnel stopped unexpectedly (exit code {exitCode}). Last logs:\n{lastLines}";
+            PublishStatus();
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await DisconnectAsync().ConfigureAwait(false);
+                }
+                catch
+                {
+                }
+            });
+        }
+    }
+
+    private void StopSingBoxProcess()
+    {
+        _adminVpnMonitorCts?.Cancel();
+        _adminVpnMonitorCts = null;
+
+        if (!WindowsAdmin.IsAdministrator())
+        {
+            _ = Task.Run(async () => await _adminHelper.StopVpnIfAvailableAsync().ConfigureAwait(false));
+            lock (_singBoxLogLock)
+            {
+                _singBoxRecentLines.Clear();
+            }
+            return;
+        }
+
+        _vpnService.Stop();
+        lock (_singBoxLogLock)
+        {
+            _singBoxRecentLines.Clear();
+        }
+    }
+
+    private void StopTorProcess()
+    {
+        _torService.Stop();
+        _lastNewnymUtc = DateTime.MinValue;
+    }
+
+    private static bool LooksLikeDnsLogLine(string line)
+    {
+        return line.Contains("doh", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("dns", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("hijack-dns", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("[dns]", StringComparison.OrdinalIgnoreCase)
+               || line.Contains(" protocol=dns", StringComparison.OrdinalIgnoreCase)
+               || line.Contains(" protocol dns", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsFatalTorBootstrapLine(string line)
+    {
+        return line.Contains("no configured transport called", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("no such transport is supported", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("didn't launch any pluggable transport listeners", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("failed to bind", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("could not bind", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("address already in use", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("no such file or directory", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ShouldLogTorLine(string line)
+    {
+        return line.Contains("Failed", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("[warn]", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("[err]", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("warn", StringComparison.OrdinalIgnoreCase)
+               || line.Contains("error", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int ExtractProgress(string line)
+    {
+        var percentIndex = line.IndexOf('%');
+        if (percentIndex <= 0)
+        {
+            return 0;
+        }
+
+        var start = percentIndex - 1;
+        while (start >= 0 && char.IsDigit(line[start]))
+        {
+            start--;
+        }
+
+        var number = line.Substring(start + 1, percentIndex - start - 1);
+        return int.TryParse(number, out var value) ? value : 0;
+    }
+
+    private static string? ExtractBootstrapSummary(string line)
+    {
+        // Example: "Bootstrapped 25% (requesting_status): Asking for networkstatus consensus"
+        var colonIndex = line.IndexOf("):", StringComparison.Ordinal);
+        if (colonIndex < 0 || colonIndex + 2 >= line.Length)
+        {
+            return null;
+        }
+
+        var summary = line[(colonIndex + 2)..].Trim();
+        return string.IsNullOrWhiteSpace(summary) ? null : summary;
+    }
+
+    private static string GetCountryCode(string location)
+    {
+        return location switch
+        {
+            OnionHopConnectOptions.AutomaticLocationLabel => string.Empty,
+            "United States" => "us",
+            "United Kingdom" => "gb",
+            "Germany" => "de",
+            "France" => "fr",
+            "Switzerland" => "ch",
+            "Netherlands" => "nl",
+            "Canada" => "ca",
+            "Singapore" => "sg",
+            _ => string.Empty
+        };
+    }
+}

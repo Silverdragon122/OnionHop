@@ -1,4 +1,4 @@
-# OnionHop
+# OnionHop V2
 
 <div align="center">
   <img src="logo.png" alt="OnionHop Logo" width="200"/>
@@ -14,12 +14,12 @@
   </a>
 </div>
 
-**OnionHop** is a lightweight Windows WPF app that routes your traffic through **Tor** using either:
+**OnionHop V2** is a modern Windows app that routes your traffic through **Tor** using either:
 
 - **Proxy Mode (recommended):** sets the Windows proxy to Tor's local SOCKS5 endpoint.
 - **TUN/VPN Mode (Admin):** starts a system-wide tunnel via **sing-box + Wintun**.
 
-It includes a **Hybrid** option (browser-only via Tor in TUN mode) and an optional **Kill Switch** for leak prevention.
+V2 adds a redesigned UI and stronger routing controls (including **per‑app split tunneling** in Hybrid mode).
 
 > **Disclaimer**
 > OnionHop is provided "as-is". Tor usage can be illegal or restricted in some jurisdictions. You are responsible for complying with local laws and regulations.
@@ -29,50 +29,52 @@ It includes a **Hybrid** option (browser-only via Tor in TUN mode) and an option
 ## Getting Started (User)
 
 1) Install  
-   - Download the latest release from the [Releases](https://github.com/center2055/OnionHop/releases) section.
+   - Download the latest release from [Releases](https://github.com/center2055/OnionHop/releases).
    - Run the Windows installer (`OnionHop-Setup-<version>.exe`).
 
 2) Choose a mode  
-   - **Proxy Mode (no admin):** Sets Windows proxy to Tor SOCKS (best compatibility).  
-   - **TUN/VPN Mode (admin):** System-wide tunnel via sing-box + Wintun; required if apps ignore proxy settings.
+   - **Proxy Mode (no admin):** Best compatibility for proxy-aware apps.  
+   - **TUN/VPN Mode (admin):** System-wide routing via sing-box + Wintun; needed for apps that ignore proxy settings.
 
 3) Connect  
-   - Optionally select an **Exit Location**.  
-   - For TUN mode, toggle **Hybrid** if you want browsers via Tor and other apps direct.  
-   - Click **Connect**. Use **Disconnect** to stop Tor/tunnel (run as Administrator to fully clear kill-switch rules).
+   - Optionally choose an **Exit Location** (and optional **Entry Node** in Advanced settings).
+   - Enable **Bridges** if your network blocks Tor (snowflake/obfs4/meek/webtunnel/custom).
+   - Click **Connect**.
 
 Notes
 - Kill Switch works only in strict TUN (Hybrid off) and needs admin rights to add/remove firewall rules.  
-- Dark Mode currently affects UI only.  
-- Bundled binaries live under `OnionHop/OnionHop/tor/` and `OnionHop/OnionHop/vpn/`. Unsigned binaries can trigger AV warnings — allow only if you trust the source.
+- `.onion` sites require a Tor-aware client (Tor Browser recommended) or SOCKS remote DNS (e.g., Firefox “Proxy DNS when using SOCKS v5”).  
 
 ---
 
-## Features
+## What’s New in V2
+
+- **New UI** (Avalonia + Suki UI)
+- **Split tunneling in Hybrid mode (per‑app routing)**
+  - Choose which apps go through Tor and which go direct.
+  - Optional QUIC/UDP blocking for Tor apps to reduce bypass leaks.
+- **Snowflake AMP support** (optional AMP cache for restricted networks)
+- **Advanced Tor options**
+  - Entry node selection (optional)
+  - IPv6 toggle, hardware acceleration toggle, connection padding
+- **Quality-of-life**
+  - Restore default settings
+  - Improved settings layout and logs
+
+---
+
+## Features (Core)
 
 - Tor routing (SOCKS5)
 - System proxy mode (no admin required)
 - TUN/VPN mode via sing-box + Wintun (admin required)
-- Hybrid routing (in TUN mode: browsers via Tor, other apps direct)
-- Tor bridges / pluggable transports (obfs4, snowflake, meek-azure)
+- Hybrid routing + split tunneling (Hybrid mode)
+- Tor bridges / pluggable transports (obfs4, snowflake, meek-azure, webtunnel, custom)
 - Kill Switch (strict TUN only)
-  - If the tunnel drops unexpectedly, OnionHop blocks outbound traffic using Windows Firewall to prevent leaks.
-  - Disconnect (as Administrator) to restore normal traffic.
-- Start with Windows (optional) with start-minimized support
+- Start with Windows (optional) + start minimized
 - Minimize-to-tray option on close
 - Auto-update checks via GitHub releases
-- Native Windows UI theme toggle
-- Persisted settings
-  - Auto-Connect
-  - Start with Windows + Start Minimized
-  - Minimize to Tray
-  - Auto Update
-  - Dark Mode
-  - Native Windows UI
-  - Kill Switch toggle
-  - Exit Location
-  - Connection mode + Hybrid
-- Logs / About / Settings overlay panels
+- Logs (App + DNS) and diagnostics
 
 ---
 
@@ -81,32 +83,16 @@ Notes
 ### 1) Proxy Mode (Recommended)
 - Starts Tor locally.
 - Sets Windows proxy to `socks=127.0.0.1:9050`.
-- Best compatibility; no admin required.
+- No admin required.
 
 ### 2) TUN/VPN Mode (Admin)
 - Starts Tor + sing-box + Wintun.
-- Can route traffic at OS level.
+- Routes traffic at OS level.
 - Requires Administrator.
 
-### Hybrid (browser via Tor)
+### Hybrid (Split tunneling)
 - Only applies in **TUN/VPN Mode**.
-- Routes common browsers (Edge/Chrome/Firefox) through Tor.
-- Other traffic goes direct.
-
----
-
-## Kill Switch
-
-The Kill Switch is intentionally conservative:
-
-- Only available in **TUN/VPN Mode** with **Hybrid disabled (strict)**.
-- Requires **Administrator** to apply/clear firewall rules.
-- If Tor/sing-box exits unexpectedly while connected in strict TUN, OnionHop adds an **Outbound Block** firewall rule.
-
-If you ever lose internet after a crash:
-
-1. Relaunch OnionHop **as Administrator**.
-2. Click **Disconnect**.
+- Lets you route selected apps through Tor while keeping others direct.
 
 ---
 
@@ -114,146 +100,30 @@ If you ever lose internet after a crash:
 
 OnionHop stores settings here:
 
-- `%AppData%\OnionHop\settings.json`
+- `%AppData%\\OnionHop\\settings.json`
 
 ---
 
-## Build & run (Developer)
+## Repository layout
 
-### Requirements
+- `OnionHop V2/` – OnionHop V2 (Avalonia UI)
+- `OnionHop/` – legacy OnionHop v1.x (WPF) codebase
 
-- Windows 10/11
-- .NET SDK **9.0** (project targets `net9.0-windows`)
-- PowerShell
+---
 
-### 1) Download dependencies
-Prebuilt binaries are not stored in the repository. You must fetch them first:
+## Building (Dev)
 
-```powershell
-./download-deps.ps1
-```
+### Build the V2 installer (Windows)
 
-This will download Tor, pluggable transports, Sing-box, and Wintun to the correct folders.
+Prereqs:
+- .NET SDK 9
+- Inno Setup 6
 
-### 2) Build
+Build:
 
 ```powershell
-# from OnionHop/OnionHop
-dotnet build -c Release
-```
-
-### 3) Publish
-
-```powershell
-# from OnionHop/OnionHop
-dotnet publish -c Release -r win-x64 --self-contained false
+powershell -NoProfile -ExecutionPolicy Bypass -File installer/build-installer-v2.ps1
 ```
 
 Output:
-
-- `OnionHop/OnionHop/bin/Release/net9.0-windows/win-x64/publish/`
-
-> If publish fails with "file is being used by another process", close any running `OnionHop.exe`.
-
----
-
-## Create an installer (Setup.exe)
-
-OnionHop can be packaged into a shareable Windows installer using **Inno Setup 6**.
-
-### Requirements
-
-- Install **Inno Setup 6** (adds `ISCC.exe`).
-
-### Build
-
-From the repo root:
-
-```powershell
-# 1. Download dependencies (if not done already)
-./download-deps.ps1
-
-# 2. Build a self-contained installer (recommended for sharing)
-./installer/build-installer.ps1 -SelfContained
-```
-
-The installer will be created here:
-
 - `installer/output/OnionHop-Setup-<version>.exe`
-
-If you prefer framework-dependent (requires .NET runtime on the target machine):
-
-```powershell
-./installer/build-installer.ps1
-```
-
----
-
-## Bundled dependencies
-
-This repo **does not** include runtime binaries in git.
-The `download-deps.ps1` script fetches them from official sources:
-
-- **Tor Expert Bundle**: `OnionHop/OnionHop/tor/`
-- **Sing-box & Wintun**: `OnionHop/OnionHop/vpn/`
-
-These are copied to output/publish via `OnionHop.csproj`.
-
----
-
-## Privacy / Logging
-
-- No telemetry is sent.
-- Logs are local-only (app UI "Logs" panel).
-- Proxy mode edits Windows proxy settings; TUN mode may add/remove Windows Firewall rules when Kill Switch is active.
-
----
-
-## Troubleshooting
-
-### Proxy mode doesn't affect some apps
-Many apps ignore the Windows proxy settings. Use **TUN/VPN Mode** if you need system-wide routing.
-
-### TUN/VPN mode fails to start
-- Run OnionHop **as Administrator**.
-- Ensure `vpn/wintun.dll` and `vpn/sing-box.exe` exist.
-
-### Internet blocked after crash
-This usually means the kill switch firewall rule is still present.
-- Relaunch as **Administrator**
-- Click **Disconnect**
-
-### Tor bootstrap is slow
-Some networks block or throttle Tor.
-- Try a different Exit Location.
-- Enable Tor bridges in Settings (obfs4, snowflake, meek-azure) or paste custom bridges.
-
----
-
-## Security notes
-
-- OnionHop modifies **Windows proxy settings** in Proxy Mode.
-- OnionHop may modify **Windows Firewall rules** when Kill Switch is enabled.
-- Avoid running unknown binaries with elevated privileges.
-
----
-
-## Roadmap / Ideas
-
-- Separate services (TorService/VpnService/SettingsService) for cleaner architecture
-- Better kill switch: allow-only rules (Tor + tunnel) instead of emergency global block
-- More diagnostics and structured logging
-
----
-
-## License
-
-GPLv3. See `LICENSE`.
-
----
-
-## Support / Issues
-
-For support, please either:
-- Open an issue on this repository
-- Join the Discord server: https://discord.gg/y3MVspPzKQ

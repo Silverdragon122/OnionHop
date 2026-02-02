@@ -19,6 +19,15 @@ Desktop.ini
 # Logs
 *.log
 
+# Node / tooling
+node_modules/
+.cursor/
+SukiUI-main/
+VPN-Client-UI/
+package.json
+package-lock.json
+build_errors.txt
+
 # Publish output (optional; publish artifacts should not be committed)
 **/publish/
 

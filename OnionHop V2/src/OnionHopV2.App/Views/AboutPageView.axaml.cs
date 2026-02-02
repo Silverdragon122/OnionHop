@@ -1,0 +1,41 @@
+using System;
+using System.Diagnostics;
+using Avalonia.Controls;
+using Avalonia.Interactivity;
+
+namespace OnionHopV2.App.Views;
+
+public partial class AboutPageView : UserControl
+{
+    private static readonly Uri DiscordUri = new("https://discord.gg/y3MVspPzKQ");
+
+    public AboutPageView()
+    {
+        InitializeComponent();
+    }
+
+    private void OnOpenReleasesClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        OpenUri(new Uri("https://github.com/center2055/OnionHop/issues"));
+    }
+
+    private void OnOpenDiscordClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        OpenUri(DiscordUri);
+    }
+
+    private static void OpenUri(Uri uri)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = uri.AbsoluteUri,
+                UseShellExecute = true
+            });
+        }
+        catch
+        {
+        }
+    }
+}
