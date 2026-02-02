@@ -603,6 +603,13 @@ public sealed class OnionHopClient : IDisposable
 
         var countryCode = GetCountryCode(options.SelectedLocation);
         var entryCode = GetCountryCode(options.SelectedEntryLocation);
+        if (options.UseTorBridges && !string.IsNullOrWhiteSpace(entryCode))
+        {
+            // Tor does not allow UseBridges together with EntryNodes.
+            // When bridges are enabled we silently ignore the entry pin to avoid a hard failure.
+            RaiseLog("Note: Entry node pinning is not compatible with Tor bridges and will be ignored.");
+            entryCode = null;
+        }
         var config = new TorLaunchConfig
         {
             TorPath = torPath,
