@@ -5,7 +5,7 @@
 </div>
 
 <div align="center">
-  <a href="assets/onionhop-ui.png"><img src="assets/onionhop-ui.png" alt="OnionHop UI Screenshot" width="800"/></a>
+  <a href="assets/onionhop-v2-ui.png"><img src="assets/onionhop-v2-ui.png" alt="OnionHop V2 UI Screenshot" width="800"/></a>
 </div>
 
 <div align="center">
