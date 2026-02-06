@@ -1,0 +1,81 @@
+param(
+  [string]$Configuration = "Release",
+  [string]$Runtime = "win-x64",
+  [switch]$FrameworkDependent,
+  [switch]$SkipDependencies
+)
+
+$ErrorActionPreference = "Stop"
+
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$solutionRoot = Join-Path $repoRoot "OnionHop V2"
+$projectDir = Join-Path $solutionRoot "src\\OnionHopV2.App"
+$csproj = Join-Path $projectDir "OnionHopV2.App.csproj"
+
+if (!(Test-Path $csproj)) {
+  throw "Could not find OnionHopV2.App.csproj at: $csproj"
+}
+
+$depsScript = Join-Path $repoRoot "download-deps.ps1"
+if (-not $SkipDependencies) {
+  if (!(Test-Path $depsScript)) {
+    throw "Could not find download-deps.ps1 at: $depsScript"
+  }
+
+  Write-Host "Downloading dependencies..." -ForegroundColor Cyan
+  & powershell -NoProfile -ExecutionPolicy Bypass -File $depsScript -NoPause
+  if ($LASTEXITCODE -ne 0) {
+    Write-Warning "Dependency download failed (exit code $LASTEXITCODE). Attempting to continue if dependencies are already present..."
+
+    $torExe = Join-Path $repoRoot "OnionHop\\tor\\tor.exe"
+    $singBoxExe = Join-Path $repoRoot "OnionHop\\vpn\\sing-box.exe"
+    $wintunDll = Join-Path $repoRoot "OnionHop\\vpn\\wintun.dll"
+
+    $missing = @()
+    foreach ($p in @($torExe, $singBoxExe, $wintunDll)) {
+      if (!(Test-Path $p)) { $missing += $p }
+    }
+
+    if ($missing.Count -gt 0) {
+      throw ("Dependency download failed and required files are missing:`n - " + ($missing -join "`n - "))
+    }
+
+    Write-Host "Dependencies already present. Continuing..." -ForegroundColor Yellow
+  }
+}
+
+$sc = if ($FrameworkDependent.IsPresent) { "false" } else { "true" }
+
+Write-Host "Publishing OnionHop V2 (portable package)..." -ForegroundColor Cyan
+
+# Remove old build artifacts to ensure a fresh publish
+if (Test-Path "$projectDir\\bin") { Remove-Item -Recurse -Force "$projectDir\\bin" }
+if (Test-Path "$projectDir\\obj") { Remove-Item -Recurse -Force "$projectDir\\obj" }
+
+& dotnet clean $solutionRoot -c $Configuration
+& dotnet publish $csproj -c $Configuration -r $Runtime --self-contained $sc /p:PublishSingleFile=false /p:PublishReadyToRun=false
+
+$publishDir = Join-Path $projectDir "bin\\$Configuration\\net9.0\\$Runtime\\publish"
+if (!(Test-Path $publishDir)) {
+  throw "Publish directory not found: $publishDir"
+}
+
+$version = "0.0.0"
+try {
+  $xml = [xml](Get-Content $csproj)
+  $pv = $xml.Project.PropertyGroup.Version
+  if ($pv) { $version = $pv.Trim() }
+} catch {
+}
+
+$outDir = Join-Path $PSScriptRoot "output"
+if (!(Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir | Out-Null }
+
+$zipName = "OnionHopV2-Portable-$version-$Runtime.zip"
+$zipPath = Join-Path $outDir $zipName
+
+if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
+Compress-Archive -Path (Join-Path $publishDir "*") -DestinationPath $zipPath -Force
+
+Write-Host "Done. Portable ZIP is in: $zipPath" -ForegroundColor Green
+

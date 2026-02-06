@@ -300,6 +300,7 @@ internal sealed class TorBridgeManager
             return pluginLine;
         }
 
+        log($"Snowflake AMP cache enabled: {uri}");
         return pluginLine + $" -ampcache {uri}";
     }
 

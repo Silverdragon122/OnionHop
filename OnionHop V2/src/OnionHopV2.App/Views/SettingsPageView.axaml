@@ -174,11 +174,17 @@
                                        FontSize="16"
                                        FontWeight="SemiBold" />
 
-                            <StackPanel Spacing="6">
-                                <TextBlock Text="Entry node (optional)" Opacity="0.75" />
-                                <ComboBox ItemsSource="{Binding State.Locations}"
+                             <StackPanel Spacing="6">
+                                 <TextBlock Text="Entry node (optional)" Opacity="0.75" />
+                                 <ComboBox ItemsSource="{Binding State.Locations}"
+                                          IsEnabled="{Binding State.CanSelectEntryLocation}"
                                           SelectedItem="{Binding State.SelectedEntryLocation}" />
-                            </StackPanel>
+
+                                 <TextBlock Text="Entry nodes can’t be used together with bridges."
+                                            Opacity="0.75"
+                                            TextWrapping="Wrap"
+                                            IsVisible="{Binding State.UseTorBridges}" />
+                             </StackPanel>
 
                             <StackPanel Spacing="6">
                                 <TextBlock Text="IPv6 support" Opacity="0.75" />

@@ -225,6 +225,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     public bool IsTunMode => string.Equals(SelectedConnectionMode, ConnectionModeTun, StringComparison.Ordinal);
     public bool IsProxyMode => !IsTunMode;
     public bool CanUseKillSwitch => IsTunMode && !UseHybridRouting;
+    public bool CanSelectEntryLocation => !UseTorBridges;
     public bool IsCustomDoh => string.Equals(SelectedDnsProvider, DnsProviderCustom, StringComparison.Ordinal);
     public bool UseCustomBridges => string.Equals(SelectedBridgeType, "custom", StringComparison.OrdinalIgnoreCase);
     public bool IsSnowflakeBridgeSelected => string.Equals(SelectedBridgeType, "snowflake", StringComparison.OrdinalIgnoreCase);
@@ -236,6 +237,11 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     {
         OnPropertyChanged(nameof(UseCustomBridges));
         OnPropertyChanged(nameof(IsSnowflakeBridgeSelected));
+    }
+
+    partial void OnUseTorBridgesChanged(bool value)
+    {
+        OnPropertyChanged(nameof(CanSelectEntryLocation));
     }
 
     partial void OnIsConnectingChanged(bool value)

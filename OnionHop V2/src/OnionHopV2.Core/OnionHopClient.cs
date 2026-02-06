@@ -64,6 +64,7 @@ public sealed class OnionHopClient : IDisposable
 
     private DateTime _lastNewnymUtc = DateTime.MinValue;
     private OnionHopConnectOptions? _activeOptions;
+    private bool _snowflakeAmpHintShown;
 
     private readonly object _singBoxLogLock = new();
     private readonly Queue<string> _singBoxRecentLines = new();
@@ -191,6 +192,7 @@ public sealed class OnionHopClient : IDisposable
         timeoutCts.CancelAfter(connectTimeout);
 
         _activeOptions = options;
+        _snowflakeAmpHintShown = false;
         SetStatus(
             isConnecting: true,
             isConnected: false,
@@ -939,6 +941,18 @@ public sealed class OnionHopClient : IDisposable
 
         if (ShouldLogTorLine(line))
         {
+            if (_isConnecting
+                && !_snowflakeAmpHintShown
+                && _activeOptions is { UseTorBridges: true, UseSnowflakeAmp: false } options
+                && string.Equals(options.SelectedBridgeType, "snowflake", StringComparison.OrdinalIgnoreCase)
+                && line.Contains("snowflake-client.exe", StringComparison.OrdinalIgnoreCase)
+                && line.Contains("broker failure", StringComparison.OrdinalIgnoreCase))
+            {
+                _snowflakeAmpHintShown = true;
+                _statusMessage = "Snowflake broker unreachable. Try enabling AMP cache in Settings → Network.";
+                PublishStatus();
+            }
+
             RaiseLog($"Tor log: {line}");
         }
     }
